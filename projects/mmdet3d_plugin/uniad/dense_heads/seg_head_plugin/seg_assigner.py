@@ -291,8 +291,8 @@ class HungarianAssigner_filter(BaseAssigner):
             assigned_labels[matched_row_inds] = gt_labels[matched_col_inds]
             if i == 0:
                 result = AssignResult(num_gts, assigned_gt_inds.clone(), None, labels=assigned_labels.clone())
-            if cost[matched_row_inds,matched_col_inds].max()>=INF:
-                break
+            # if cost[matched_row_inds,matched_col_inds].max()>=INF:
+            #     break
         pos_ind = assigned_gt_inds.gt(0).nonzero().squeeze(1)
         neg_ind = assigned_gt_inds.eq(0).nonzero().squeeze(1)
         

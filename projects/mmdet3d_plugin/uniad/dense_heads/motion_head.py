@@ -462,6 +462,9 @@ class MotionHead(BaseMotionHead):
         torch.Tensor: A concatenated tensor of the matched ground truth future trajectories.
         torch.Tensor: A concatenated tensor of the matched ground truth future trajectory masks.
         """
+        # track_bbox_results = track_bbox_results.to(gt_fut_traj.device)
+        # gt_bboxes_3d = gt_bboxes_3d.to(gt_fut_traj.device)
+
         num_imgs = len(all_matched_idxes)
         gt_fut_traj_all = []
         gt_fut_traj_mask_all = []
@@ -472,8 +475,9 @@ class MotionHead(BaseMotionHead):
             matched_gt_fut_traj_mask = gt_fut_traj_mask[i][matched_gt_idx][valid_traj_masks]
             if self.use_nonlinear_optimizer:
                 # TODO: sdc query is not supported non-linear optimizer
-                bboxes = track_bbox_results[i][0].tensor[valid_traj_masks]
-                matched_gt_bboxes_3d = gt_bboxes_3d[i][-1].tensor[matched_gt_idx[:-1]
+                # bboxes = track_bbox_results[i][0].tensor[valid_traj_masks]
+                bboxes = track_bbox_results[i][0].tensor.to(valid_traj_masks.device)[valid_traj_masks]
+                matched_gt_bboxes_3d = gt_bboxes_3d[i][-1].tensor.to(valid_traj_masks.device)[matched_gt_idx[:-1]
                                                                   ][valid_traj_masks[:-1]]
                 sdc_gt_fut_traj = matched_gt_fut_traj[-1:]
                 sdc_gt_fut_traj_mask = matched_gt_fut_traj_mask[-1:]

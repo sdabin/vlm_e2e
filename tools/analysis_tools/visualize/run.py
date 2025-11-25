@@ -28,8 +28,8 @@ class Visualizer:
 
     def __init__(
             self,
-            dataroot='/mnt/petrelfs/yangjiazhi/e2e_proj/data/nus_mini',
-            version='v1.0-mini',
+            dataroot='/home/user/UniAD/data/nuscenes',
+            version='v1.0-trainval',
             predroot=None,
             with_occ_map=False,
             with_map=False,
@@ -297,7 +297,7 @@ def main(args):
         show_sdc_traj=False
     )
 
-    viser = Visualizer(version='v1.0-mini', predroot=args.predroot, dataroot='data/nuscenes', **render_cfg)
+    viser = Visualizer(version='v1.0-trainval', predroot=args.predroot, dataroot='/home/user/UniAD/data/nuscenes', **render_cfg)
 
     if not os.path.exists(args.out_folder):
         os.makedirs(args.out_folder)

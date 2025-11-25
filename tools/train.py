@@ -76,7 +76,8 @@ def parse_args():
         choices=['none', 'pytorch', 'slurm', 'mpi'],
         default='none',
         help='job launcher')
-    parser.add_argument('--local_rank', type=int, default=0)
+    # parser.add_argument('--local_rank', type=int, default=0)
+    parser.add_argument('--local-rank', type=int, default=0)
     parser.add_argument(
         '--autoscale-lr',
         action='store_true',
@@ -97,6 +98,8 @@ def parse_args():
 
 
 def main():
+    # import torch.multiprocessing as mp
+    # mp.set_start_method('fork', force=True)
     args = parse_args()
 
     cfg = Config.fromfile(args.config)

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 T=`date +%m%d%H%M`
-DATE_STR=`date +%Y%m%d_%H%M`
+
 # -------------------------------------------------- #
 # Usually you only need to customize these variables #
 CFG=$1                                               #
@@ -14,9 +14,7 @@ MASTER_PORT=${MASTER_PORT:-28596}
 MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 RANK=${RANK:-0}
 
-BASE_WORK_DIR=$(echo ${CFG%.*} | sed -e "s/configs/work_dirs/g")
-WORK_DIR=${BASE_WORK_DIR}_${DATE_STR}/
-
+WORK_DIR=$(echo ${CFG%.*} | sed -e "s/configs/work_dirs/g")/
 # Intermediate files and logs will be saved to UniAD/projects/work_dirs/
 
 if [ ! -d ${WORK_DIR}logs ]; then

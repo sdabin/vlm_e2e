@@ -4,6 +4,7 @@
 # Copyright (c) OpenDriveLab. All rights reserved.                                #
 #---------------------------------------------------------------------------------#
 
+import os
 import copy
 import numpy as np
 import torch
@@ -133,39 +134,137 @@ class NuScenesE2EDataset(NuScenesDataset):
         self.occ_filter_by_valid_flag = occ_filter_by_valid_flag
         self.occ_only_total_frames = 7  # NOTE: hardcode, not influenced by planning
 
+        def __getstate__(self):
+            """DataLoader가 워커를 띄우며 dataset을 pickle할 때 호출됨.
+            dict-views, set, (중첩된) 컨테이너 내부의 피클 불가 객체를 안전한 형태로 변환한다.
+            """
+            state = self.__dict__.copy()
+
+            def _sanitize(x):
+                # dict view → list
+                if isinstance(x, (KeysView, ValuesView, ItemsView)):
+                    return list(x)
+                # set → list
+                if isinstance(x, set):
+                    return list(x)
+                # 재귀적으로 컨테이너 내부까지 정리
+                if isinstance(x, tuple):
+                    return tuple(_sanitize(xx) for xx in x)
+                if isinstance(x, list):
+                    return [_sanitize(xx) for xx in x]
+                if isinstance(x, dict):
+                    return {k: _sanitize(v) for k, v in x.items()}
+                return x
+
+            for k, v in list(state.items()):
+                state[k] = _sanitize(v)
+
+            # (선택) 혹시 열려있는 파일 핸들이 있다면 닫고 제거하고 싶을 때:
+            # for k, v in list(state.items()):
+            #     if hasattr(v, "read") and hasattr(v, "close"):
+            #         try: v.close()
+            #         except: pass
+            #         state[k] = None
+
+            return state
+
+        def __setstate__(self, state):
+            """워커 프로세스에서 unpickle될 때 호출."""
+            self.__dict__.update(state)
+
     def __len__(self):
         if not self.is_debug:
             return len(self.data_infos)
         else:
             return self.len_debug
 
+    # def load_annotations(self, ann_file):
+    #     """Load annotations from ann_file.
+    #     Args:
+    #         ann_file (str): Path of the annotation file.
+
+    #     Returns:
+    #         list[dict]: List of annotations sorted by timestamps.
+    #     """
+    #     if self.file_client_args['backend'] == 'disk':
+    #         # data_infos = mmcv.load(ann_file)
+            
+    #         ### 25 11 10 ###
+    #         if hasattr(ann_file, "read"):
+    #             try:
+    #                 # 혹시 중간 포인터일 수 있어 처음으로 되돌림
+    #                 try:
+    #                     ann_file.seek(0)
+    #                 except Exception:
+    #                     pass
+    #                 data_bytes = ann_file.read()
+    #             finally:
+    #                 # 우리가 연 건 아니지만, 여기서 닫아줘야 누수/락 방지
+    #                 try:
+    #                     ann_file.close()
+    #                 except Exception:
+    #                     pass
+    #             data = pickle.loads(data_bytes)
+                
+    #         # 2) 경로(str/Path)인 경우: file_client 사용
+    #         if isinstance(ann_file, (str, os.PathLike)):
+    #             data_bytes = self.file_client.get(ann_file)
+    #             data = pickle.loads(data_bytes)
+    #         ### 25 11 10 ###
+
+    #         data = pickle.loads(self.file_client.get(ann_file))
+    #         data_infos = list(
+    #             sorted(data['infos'], key=lambda e: e['timestamp']))
+    #         data_infos = data_infos[::self.load_interval]
+    #         self.metadata = data['metadata']
+    #         self.version = self.metadata['version']
+    #     elif self.file_client_args['backend'] == 'petrel':
+    #         data = pickle.loads(self.file_client.get(ann_file))
+    #         data_infos = list(
+    #             sorted(data['infos'], key=lambda e: e['timestamp']))
+    #         data_infos = data_infos[::self.load_interval]
+    #         self.metadata = data['metadata']
+    #         self.version = self.metadata['version']
+    #     else:
+    #         assert False, 'Invalid file_client_args!'
+    #     return data_infos
+
     def load_annotations(self, ann_file):
-        """Load annotations from ann_file.
-        Args:
-            ann_file (str): Path of the annotation file.
+        """Load annotations from file path or already-opened file object."""
+        import os, pickle
 
-        Returns:
-            list[dict]: List of annotations sorted by timestamps.
-        """
-        if self.file_client_args['backend'] == 'disk':
-            # data_infos = mmcv.load(ann_file)
-            data = pickle.loads(self.file_client.get(ann_file))
-            data_infos = list(
-                sorted(data['infos'], key=lambda e: e['timestamp']))
+        # file-like 로 들어온 경우: file_client 쓰지 말고 직접 읽기
+        if hasattr(ann_file, 'read'):
+            try:
+                try:
+                    ann_file.seek(0)
+                except Exception:
+                    pass
+                data_bytes = ann_file.read()
+            finally:
+                try:
+                    ann_file.close()
+                except Exception:
+                    pass
+            data = pickle.loads(data_bytes)
+            data_infos = sorted(data['infos'], key=lambda e: e['timestamp'])
             data_infos = data_infos[::self.load_interval]
             self.metadata = data['metadata']
             self.version = self.metadata['version']
-        elif self.file_client_args['backend'] == 'petrel':
+            return data_infos
+
+        # 문자열/Path 경로인 경우: 백엔드에 맞춰 file_client 사용
+        if isinstance(ann_file, (str, os.PathLike)):
             data = pickle.loads(self.file_client.get(ann_file))
-            data_infos = list(
-                sorted(data['infos'], key=lambda e: e['timestamp']))
+            data_infos = sorted(data['infos'], key=lambda e: e['timestamp'])
             data_infos = data_infos[::self.load_interval]
             self.metadata = data['metadata']
             self.version = self.metadata['version']
-        else:
-            assert False, 'Invalid file_client_args!'
-        return data_infos
+            return data_infos
 
+        raise TypeError(f'Unexpected ann_file type: {type(ann_file)}')
+
+        
     def prepare_train_data(self, index):
         """
         Training data preparation.
@@ -180,10 +279,14 @@ class NuScenesE2EDataset(NuScenesDataset):
                 gt_inds: gt_inds of each frame (list)
         """
         data_queue = []
-        self.enbale_temporal_aug = False
-        if self.enbale_temporal_aug:
+
+        # 클래스에 설정된 값을 읽기만 (오타 방지: enable_temporal_aug로 통일)
+        enable_temporal_aug = bool(getattr(self, "enable_temporal_aug",
+                                        getattr(self, "enbale_temporal_aug", False)))
+
+        if enable_temporal_aug:
             # temporal aug
-            prev_indexs_list = list(range(index-self.queue_length, index))
+            prev_indexs_list = list(range(index - self.queue_length, index))
             random.shuffle(prev_indexs_list)
             prev_indexs_list = sorted(prev_indexs_list[1:], reverse=True)
             input_dict = self.get_data_info(index)
@@ -196,7 +299,6 @@ class NuScenesE2EDataset(NuScenesDataset):
             if self.data_infos[first_index]['scene_token'] != \
                     self.data_infos[final_index]['scene_token']:
                 return None
-            # current timestamp
             input_dict = self.get_data_info(final_index)
             prev_indexs_list = list(reversed(range(first_index, final_index)))
         if input_dict is None:

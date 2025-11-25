@@ -28,7 +28,7 @@ class BBox3DL1Cost(object):
         return bbox_cost * self.weight
 
 
-@MATCH_COST.register_module()
+@MATCH_COST.register_module(name='DiceCost3D')
 class DiceCost(object):
     """IoUCost.
 

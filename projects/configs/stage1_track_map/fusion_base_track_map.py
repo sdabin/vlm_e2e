@@ -1,23 +1,15 @@
 _base_ = ["../_base_/datasets/nus-3d.py",
           "../_base_/default_runtime.py"]
 
-# Update-2023-06-12: 
-# [Enhance] Update some freezing args of UniAD 
-# [Bugfix] Reproduce the from-scratch results of stage1
-# 1. Remove loss_past_traj in stage1 training
-# 2. Unfreeze neck and BN
-# --> Reproduced tracking result: AMOTA 0.393
-
-
-# Unfreeze neck and BN, the from-scratch results of stage1 could be reproduced
 plugin = True
 plugin_dir = "projects/mmdet3d_plugin/"
 # If point cloud range is changed, the models should also change their point
 # cloud range accordingly
-point_cloud_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
-voxel_size = [0.2, 0.2, 8]
+point_cloud_range = [-54.0, -54.0, -5.0, 54.0, 54.0, 3.0]
+voxel_size = [0.075, 0.075, 0.2]
 patch_size = [102.4, 102.4]
 img_norm_cfg = dict(mean=[103.530, 116.280, 123.675], std=[1.0, 1.0, 1.0], to_rgb=False)
+lidar_sweep_num = 10
 # For nuScenes we usually do 10-class detection
 class_names = [
     "car",
@@ -33,7 +25,7 @@ class_names = [
 ]
 
 input_modality = dict(
-    use_lidar=False, use_camera=True, use_radar=False, use_map=False, use_external=True
+    use_lidar=True, use_camera=True, use_radar=False, use_map=False, use_external=True
 )
 _dim_ = 256
 _pos_dim_ = _dim_ // 2
@@ -45,7 +37,7 @@ _feed_dim_ = _ffn_dim_
 _dim_half_ = _pos_dim_
 canvas_size = (bev_h_, bev_w_)
 
-# NOTE: You can change queue_length from 5 to 3 to save GPU memory, but at risk of performance drop.
+# NOTE: You can change queue_length from 5 to 3 to save GPU memory.
 queue_length = 5  # each sequence contains `queue_length` frames.
 
 ### traj prediction args ###
@@ -63,10 +55,6 @@ occ_n_future_max = max([occ_n_future, occ_n_future_plan])
 ### planning ###
 planning_steps = 6
 use_col_optim = True
-# there exists multiple interpretations of the planning metric, where it differs between uniad and stp3/vad
-# uniad: computed at a particular time (e.g., L2 distance between the predicted and ground truth future trajectory at time 3.0s)
-# stp3: computed as the average up to a particular time (e.g., average L2 distance between the predicted and ground truth future trajectory up to 3.0s)
-planning_evaluation_strategy = "uniad"  # uniad or stp3
 
 ### Occ args ### 
 occflow_grid_conf = {
@@ -79,7 +67,7 @@ occflow_grid_conf = {
 train_gt_iou_threshold=0.3
 
 model = dict(
-    type="UniAD",
+    type="FusionAD",
     gt_iou_threshold=train_gt_iou_threshold,
     queue_length=queue_length,
     use_grid_mask=True,
@@ -110,9 +98,23 @@ model = dict(
         num_outs=4,
         relu_before_extra_convs=True,
     ),
-    freeze_img_backbone=True,
-    freeze_img_neck=False,
-    freeze_bn=False,
+    freeze_img_modules=True,  # set fix feats to true can fix the backbone
+    pts_voxel_layer=dict(
+        max_num_points=10,
+        point_cloud_range=point_cloud_range,
+        voxel_size=voxel_size,
+        max_voxels=(120000, 160000),
+        deterministic=False,
+    ),
+    pts_backbone=dict(
+        type='SparseEncoderHD',
+        in_channels=5,
+        sparse_shape=[41, 1440, 1440],
+        output_channels=256,
+        order=('conv', 'norm', 'act'),
+        encoder_channels=((16, 16, 32), (32, 32, 64), (64, 64, 128), (128, 128)),
+        encoder_paddings=((0, 0, 1), (0, 0, 1), (0, 0, [0, 1, 1]), (0, 0)),
+        block_type='basicblock'),  # not enable FP16 here,
     score_thresh=0.4,
     filter_score_thresh=0.35,
     qim_args=dict(
@@ -142,7 +144,6 @@ model = dict(
             type="FocalLoss", use_sigmoid=True, gamma=2.0, alpha=0.25, loss_weight=2.0
         ),
         loss_bbox=dict(type="L1Loss", loss_weight=0.25),
-        loss_past_traj_weight=0.0,
     ),  # loss cfg for tracking
     pts_bbox_head=dict(
         type="BEVFormerTrackHead",
@@ -169,11 +170,12 @@ model = dict(
                 num_points_in_pillar=4,
                 return_intermediate=False,
                 transformerlayers=dict(
-                    type="BEVFormerLayer",
+                    type="BEVFormerFusionLayer",
                     attn_cfgs=[
                         dict(
-                            type="TemporalSelfAttention", embed_dims=_dim_, num_levels=1
-                        ),
+                            type='PtsCrossAttention',
+                            embed_dims=_dim_,
+                            num_levels=1),
                         dict(
                             type="SpatialCrossAttention",
                             pc_range=point_cloud_range,
@@ -185,13 +187,20 @@ model = dict(
                             ),
                             embed_dims=_dim_,
                         ),
+                        dict(
+                            type="TemporalSelfAttention", 
+                            embed_dims=_dim_, 
+                            num_levels=1
+                        ),
                     ],
                     feedforward_channels=_ffn_dim_,
                     ffn_dropout=0.1,
                     operation_order=(
-                        "self_attn",
+                        'pts_cross_attn',
                         "norm",
                         "cross_attn",
+                        "norm",
+                        "self_attn",
                         "norm",
                         "ffn",
                         "norm",
@@ -338,7 +347,6 @@ model = dict(
             sampler_with_mask =dict(type='PseudoSampler_segformer'),
         ),
     ),
- 
     # model training and testing settings
     train_cfg=dict(
         pts=dict(
@@ -359,8 +367,8 @@ model = dict(
     ),
 )
 dataset_type = "NuScenesE2EDataset"
-data_root = "data/nuscenes/"
-info_root = "data/infos/"
+data_root = "./UniAD/data/nuscenes/"
+info_root = "./UniAD/data/infos/"
 file_client_args = dict(backend="disk")
 ann_file_train=info_root + f"nuscenes_infos_temporal_train.pkl"
 ann_file_val=info_root + f"nuscenes_infos_temporal_val.pkl"
@@ -368,6 +376,18 @@ ann_file_test=info_root + f"nuscenes_infos_temporal_val.pkl"
 
 
 train_pipeline = [
+    dict(
+        type='LoadPointsFromFile',
+        coord_type='LIDAR',
+        load_dim=5,
+        use_dim=5,
+        file_client_args=file_client_args),
+    dict(
+        type='LoadPointsFromMultiSweeps',
+        sweeps_num=lidar_sweep_num-1,
+        use_dim=[0, 1, 2, 3, 4],
+        pad_empty_sweeps=True,
+        remove_close=True),
     dict(type="LoadMultiViewImageFromFilesInCeph", to_float32=True, file_client_args=file_client_args, img_root=data_root),
     dict(type="PhotoMetricDistortionMultiViewImage"),
     dict(
@@ -385,6 +405,8 @@ train_pipeline = [
                                     filter_invisible=False),  # NOTE: Currently vis_token is not in pkl 
 
     dict(type="ObjectRangeFilterTrack", point_cloud_range=point_cloud_range),
+    dict(type='PointsRangeFilter', point_cloud_range=point_cloud_range),
+    dict(type='PointShuffle'),
     dict(type="ObjectNameFilterTrack", classes=class_names),
     dict(type="NormalizeMultiviewImage", **img_norm_cfg),
     dict(type="PadMultiViewImage", size_divisor=32),
@@ -396,6 +418,7 @@ train_pipeline = [
             "gt_labels_3d",
             "gt_inds",
             "img",
+            "points",
             "timestamp",
             "l2g_r_mat",
             "l2g_t",
@@ -430,6 +453,19 @@ train_pipeline = [
     ),
 ]
 test_pipeline = [
+    dict(
+        type='LoadPointsFromFile',
+        coord_type='LIDAR',
+        load_dim=5,
+        use_dim=5,
+        file_client_args=file_client_args),
+    dict(
+        type='LoadPointsFromMultiSweeps',
+        sweeps_num=lidar_sweep_num - 1,
+        use_dim=[0, 1, 2, 3, 4],
+        pad_empty_sweeps=True,
+        remove_close=True),
+    dict(type='PointsRangeFilter', point_cloud_range=point_cloud_range),
     dict(type='LoadMultiViewImageFromFilesInCeph', to_float32=True,
             file_client_args=file_client_args, img_root=data_root),
     dict(type="NormalizeMultiviewImage", **img_norm_cfg),
@@ -457,6 +493,7 @@ test_pipeline = [
             dict(
                 type="CustomCollect3D", keys=[
                                             "img",
+                                            "points",
                                             "timestamp",
                                             "l2g_r_mat",
                                             "l2g_t",
@@ -482,7 +519,7 @@ test_pipeline = [
 ]
 data = dict(
     samples_per_gpu=1,
-    workers_per_gpu=1,
+    workers_per_gpu=8,
     train=dict(
         type=dataset_type,
         file_client_args=file_client_args,
@@ -556,10 +593,11 @@ data = dict(
 )
 optimizer = dict(
     type="AdamW",
-    lr=2e-4,
+    lr=1.2e-4,
     paramwise_cfg=dict(
         custom_keys={
             "img_backbone": dict(lr_mult=0.1),
+            # "pts_backbone": dict(lr_mult=0.1),
         }
     ),
     weight_decay=0.01,
@@ -569,21 +607,17 @@ optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
 lr_config = dict(
     policy="CosineAnnealing",
     warmup="linear",
-    warmup_iters=500,
+    warmup_iters=1,
     warmup_ratio=1.0 / 3,
     min_lr_ratio=1e-3,
 )
-total_epochs = 6
-evaluation = dict(
-    interval=6,
-    pipeline=test_pipeline,
-    planning_evaluation_strategy=planning_evaluation_strategy,
-)
+total_epochs = 20
+evaluation = dict(interval=1, pipeline=test_pipeline)
 runner = dict(type="EpochBasedRunner", max_epochs=total_epochs)
 log_config = dict(
-    interval=10, hooks=[dict(type="TextLoggerHook"), dict(type="TensorboardLoggerHook")]
+    interval=50, hooks=[dict(type="TextLoggerHook"), dict(type="TensorboardLoggerHook")]
 )
 checkpoint_config = dict(interval=1)
-load_from = "ckpts/bevformer_r101_dcn_24ep.pth"
-
+load_from = None
+work_dir = './work_dirs/'
 find_unused_parameters = True

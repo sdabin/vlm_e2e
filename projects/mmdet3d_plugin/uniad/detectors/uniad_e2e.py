@@ -205,11 +205,11 @@ class UniAD(UniADTrack):
                 outs_motion['traj_query'] = torch.zeros((3, 1, 1, 6, 256)).to(bev_embed)
                 outs_motion['all_matched_idxes'] = [[-1]]
             losses_occ = self.occ_head.forward_train(
-                            bev_embed, 
-                            outs_motion, 
+                            bev_embed,
+                            outs_motion,
                             gt_inds_list=gt_inds,
-                            gt_segmentation=gt_segmentation,
-                            gt_instance=gt_instance,
+                            gt_segmentation=gt_segmentation,  
+                            gt_instance=gt_instance, 
                             gt_img_is_valid=gt_occ_img_is_valid,
                         )
             losses_occ = self.loss_weighted_and_prefixed(losses_occ, prefix='occ')

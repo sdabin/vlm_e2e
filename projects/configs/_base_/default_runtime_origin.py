@@ -16,12 +16,3 @@ work_dir = None
 load_from = None
 resume_from = None
 workflow = [('train', 1)]
-
-visualizer = dict(
-    type='Det3DLocalVisualizer',
-    vis_backends=[
-        dict(type='LocalVisBackend'),          # 로컬 파일 저장
-        dict(type='TensorboardVisBackend')     # TensorBoard 로그
-    ],
-    name='visualizer'  # 이 이름으로 get_instance() 호출
-)

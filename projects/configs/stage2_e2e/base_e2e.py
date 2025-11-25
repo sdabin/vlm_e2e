@@ -596,7 +596,7 @@ test_pipeline = [
 ]
 data = dict(
     samples_per_gpu=1,
-    workers_per_gpu=8,
+    workers_per_gpu=2,
     train=dict(
         type=dataset_type,
         file_client_args=file_client_args,
@@ -641,7 +641,7 @@ data = dict(
         modality=input_modality,
         samples_per_gpu=1,
         eval_mod=['det', 'map', 'track','motion'],
-        
+        # eval_mod=['planning'],
 
         occ_receptive_field=3,
         occ_n_future=occ_n_future_max,
@@ -665,6 +665,7 @@ data = dict(
         classes=class_names,
         modality=input_modality,
         eval_mod=['det', 'map', 'track','motion'],
+        # eval_mod=['planning'],
     ),
     shuffler_sampler=dict(type="DistributedGroupSampler"),
     nonshuffler_sampler=dict(type="DistributedSampler"),

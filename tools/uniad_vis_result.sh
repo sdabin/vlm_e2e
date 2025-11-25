@@ -1,7 +1,8 @@
 #!/bin/bash
 
+PYTHONPATH="$(dirname $0)/..":$PYTHONPATH \
 python ./tools/analysis_tools/visualize/run.py \
-    --predroot PATH_TO_YOUR_PREDISION_RESULT_PKL \
-    --out_folder PATH_TO_YOUR_OUTPUT_FOLDER \
-    --demo_video FILENAME_OF_OUTPUT_VIDEO \
+    --predroot output/results.pkl \
+    --out_folder 251111 \
+    --demo_video test_demo.avi \
     --project_to_cam True
