@@ -25,7 +25,8 @@ from mmseg import __version__ as mmseg_version
 warnings.filterwarnings("ignore")
 
 from mmcv.utils import TORCH_VERSION, digit_version
-
+import torch.multiprocessing as mp
+mp.set_start_method('fork', force=True)
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train a detector')
