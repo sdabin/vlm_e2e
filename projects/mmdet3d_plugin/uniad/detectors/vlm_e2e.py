@@ -425,6 +425,12 @@ class VlmE2E(UniADTrack):
         vlm_device=None,  # VLM GPU 지정 (None=자동, 'cpu'=CPU, 숫자=특정 GPU)
         vlm_prompt="Explain which element visible in the image is the most important for an autonomous vehicle to perform path planning.",
         vlm_max_tokens=30,
+        # Freeze 옵션들
+        freeze_seg_head=False,
+        freeze_motion_head=False,
+        freeze_occ_head=False,
+        freeze_planning_head=False,
+        freeze_vlm_proj=False,  # planning_head 내의 vlm_proj만 freeze
         **kwargs,
     ):
         super(VlmE2E, self).__init__(**kwargs)
@@ -446,6 +452,49 @@ class VlmE2E(UniADTrack):
         self._vlm_prompt = vlm_prompt
         self._vlm_max_tokens = vlm_max_tokens
         self._vlm_initialized = False
+
+        # Freeze 설정 적용
+        self._apply_freeze_settings(
+            freeze_seg_head=freeze_seg_head,
+            freeze_motion_head=freeze_motion_head,
+            freeze_occ_head=freeze_occ_head,
+            freeze_planning_head=freeze_planning_head,
+            freeze_vlm_proj=freeze_vlm_proj,
+        )
+
+    def _apply_freeze_settings(
+        self,
+        freeze_seg_head=False,
+        freeze_motion_head=False,
+        freeze_occ_head=False,
+        freeze_planning_head=False,
+        freeze_vlm_proj=False,
+    ):
+        """각 head 모듈의 freeze 설정을 적용합니다."""
+
+        if freeze_seg_head and self.with_seg_head:
+            self._freeze_module(self.seg_head, 'seg_head')
+
+        if freeze_motion_head and self.with_motion_head:
+            self._freeze_module(self.motion_head, 'motion_head')
+
+        if freeze_occ_head and self.with_occ_head:
+            self._freeze_module(self.occ_head, 'occ_head')
+
+        if freeze_planning_head and self.with_planning_head:
+            self._freeze_module(self.planning_head, 'planning_head')
+        elif freeze_vlm_proj and self.with_planning_head:
+            # planning_head 전체가 아닌 vlm_proj만 freeze
+            if hasattr(self.planning_head, 'vlm_proj'):
+                self._freeze_module(self.planning_head.vlm_proj, 'planning_head.vlm_proj')
+
+    def _freeze_module(self, module, module_name):
+        """모듈의 모든 파라미터를 freeze합니다."""
+        frozen_count = 0
+        for param in module.parameters():
+            param.requires_grad = False
+            frozen_count += 1
+        print(f"[VlmE2E] Frozen {module_name}: {frozen_count} parameters")
 
     @property
     def with_planning_head(self):
