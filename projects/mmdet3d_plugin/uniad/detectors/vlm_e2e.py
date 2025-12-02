@@ -5,6 +5,7 @@
 #---------------------------------------------------------------------------------#
 
 import torch
+import os
 from mmcv.runner import auto_fp16
 from mmdet.models import DETECTORS
 import copy
@@ -16,19 +17,102 @@ from PIL import Image
 from transformers import AutoProcessor, AutoTokenizer, LlavaForConditionalGeneration
 
 
+def get_gpu_memory_info():
+    """nvidia-smi로 모든 GPU의 메모리 정보 조회.
+
+    Returns:
+        dict: {gpu_idx: free_memory_mb} 형태의 딕셔너리
+    """
+    try:
+        import subprocess
+        result = subprocess.run(
+            ['nvidia-smi', '--query-gpu=index,memory.free', '--format=csv,noheader,nounits'],
+            capture_output=True, text=True, timeout=5
+        )
+        gpu_info = {}
+        for line in result.stdout.strip().split('\n'):
+            if line:
+                parts = line.split(',')
+                gpu_idx = int(parts[0].strip())
+                free_mem_mb = int(parts[1].strip())
+                gpu_info[gpu_idx] = free_mem_mb
+        return gpu_info
+    except Exception as e:
+        print(f"[VLM Warning] nvidia-smi 실행 실패: {e}")
+        return {}
+
+
+def find_best_vlm_gpu(min_memory_gb=14):
+    """학습 GPU를 제외하고 메모리가 충분한 GPU를 찾음.
+
+    CUDA_VISIBLE_DEVICES 환경변수를 확인하여 학습에 사용 중인 GPU를 파악하고,
+    그 외의 GPU 중 메모리가 가장 많이 남은 것을 선택합니다.
+
+    Args:
+        min_memory_gb: VLM에 필요한 최소 메모리 (GB)
+
+    Returns:
+        int or None: 사용 가능한 물리적 GPU 인덱스, 없으면 None
+    """
+    cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', None)
+
+    # 학습에 사용 중인 물리적 GPU 인덱스
+    if cuda_visible is None or cuda_visible == '':
+        # 환경변수 없음 - 학습이 모든 GPU를 사용한다고 가정
+        print("[VLM Warning] CUDA_VISIBLE_DEVICES가 설정되지 않았습니다.")
+        return None
+
+    training_physical_gpus = [int(x.strip()) for x in cuda_visible.split(',')]
+    print(f"[VLM] 학습에 사용 중인 물리적 GPU: {training_physical_gpus}")
+
+    # 모든 GPU의 메모리 정보 조회
+    gpu_memory = get_gpu_memory_info()
+    if not gpu_memory:
+        return None
+
+    # 학습 GPU를 제외하고 메모리가 충분한 GPU 찾기
+    available_gpus = []
+    for gpu_idx, free_mem_mb in gpu_memory.items():
+        if gpu_idx not in training_physical_gpus:
+            available_gpus.append((gpu_idx, free_mem_mb))
+
+    if not available_gpus:
+        print("[VLM Warning] 학습 GPU 외에 사용 가능한 GPU가 없습니다.")
+        return None
+
+    # 메모리가 충분한 GPU 우선 선택
+    sufficient_gpus = [(idx, mem) for idx, mem in available_gpus if mem >= min_memory_gb * 1024]
+
+    if sufficient_gpus:
+        # 메모리가 가장 많은 GPU 선택
+        sufficient_gpus.sort(key=lambda x: x[1], reverse=True)
+        return sufficient_gpus[0][0]
+
+    # 메모리 조건을 만족하는 GPU가 없으면 가장 여유 있는 것 선택
+    available_gpus.sort(key=lambda x: x[1], reverse=True)
+    print(f"[VLM Warning] 메모리 {min_memory_gb}GB 이상인 GPU가 없습니다. "
+          f"GPU {available_gpus[0][0]} ({available_gpus[0][1]}MB free) 사용.")
+    return available_gpus[0][0]
+
+
 class VLMInferenceManager:
     """VLM 추론을 별도 GPU에서 관리하는 클래스.
 
     UniAD가 GPU 메모리를 대부분 사용하므로 VLM은 다른 GPU에서 실행해야 함.
-    이 클래스는 VLM 모델을 지정된 GPU에 한 번만 로드하고 유지함.
+
+    사용법:
+    1. 학습 스크립트에서 VLM GPU도 CUDA_VISIBLE_DEVICES에 포함시켜야 함
+       예: CUDA_VISIBLE_DEVICES=0,1,2,3 (학습: 0,1 / VLM: 2 또는 3)
+    2. vlm_device='auto'면 CUDA_VISIBLE_DEVICES 내에서 DDP가 사용하지 않는 GPU 선택
     """
 
-    def __init__(self, vlm_device=None, model_id="llava-hf/llava-1.5-7b-hf"):
+    def __init__(self, vlm_device='auto', model_id="llava-hf/llava-1.5-7b-hf"):
         """
         Args:
             vlm_device: VLM을 실행할 GPU 디바이스.
-                        None이면 자동으로 마지막 GPU 선택.
+                        'auto'면 자동으로 남는 GPU 선택 (기본값).
                         'cpu'면 CPU에서 실행.
+                        숫자면 해당 논리적 GPU 인덱스 사용.
             model_id: HuggingFace 모델 ID
         """
         self.model_id = model_id
@@ -37,56 +121,109 @@ class VLMInferenceManager:
         self.vlm_device = vlm_device
         self._initialized = False
 
-    def _get_vlm_device(self, uniad_device):
-        """UniAD 디바이스를 기반으로 VLM 디바이스 결정.
+    def _find_available_vlm_gpu(self, min_memory_gb=14):
+        """VLM에 사용할 GPU 찾기.
+
+        CUDA_VISIBLE_DEVICES 내에서 학습에 사용되지 않는 GPU 중
+        각 DDP rank에 대응하는 VLM GPU를 선택합니다.
+
+        DDP rank 0 -> VLM GPU (world_size + 0)
+        DDP rank 1 -> VLM GPU (world_size + 1)
+        ...
 
         Args:
-            uniad_device: UniAD가 실행 중인 디바이스
+            min_memory_gb: VLM에 필요한 최소 메모리 (GB)
 
         Returns:
-            VLM을 실행할 torch.device
+            int or None: 논리적 GPU 인덱스 (CUDA_VISIBLE_DEVICES 내 인덱스), 없으면 None
         """
-        if self.vlm_device is not None:
-            if self.vlm_device == 'cpu':
-                return torch.device('cpu')
-            return torch.device(f'cuda:{self.vlm_device}')
+        cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', '')
 
-        num_gpus = torch.cuda.device_count()
-        if num_gpus < 2:
-            print(f"[VLM Warning] GPU가 {num_gpus}개뿐입니다. VLM을 CPU에서 실행합니다.")
-            return torch.device('cpu')
+        # DDP rank 확인
+        local_rank = int(os.environ.get('LOCAL_RANK', 0))
+        world_size = int(os.environ.get('WORLD_SIZE', 1))
 
-        # UniAD가 사용하지 않는 마지막 GPU 선택
-        uniad_gpu_idx = uniad_device.index if uniad_device.index is not None else 0
-        vlm_gpu_idx = num_gpus - 1
-        if vlm_gpu_idx == uniad_gpu_idx:
-            vlm_gpu_idx = num_gpus - 2 if num_gpus > 2 else 0
-            if vlm_gpu_idx == uniad_gpu_idx:
-                print("[VLM Warning] 사용 가능한 별도 GPU가 없습니다. CPU에서 실행합니다.")
-                return torch.device('cpu')
+        print(f"[VLM][Rank {local_rank}] 현재 CUDA_VISIBLE_DEVICES: {cuda_visible}")
+        print(f"[VLM][Rank {local_rank}] LOCAL_RANK: {local_rank}, WORLD_SIZE: {world_size}")
 
-        return torch.device(f'cuda:{vlm_gpu_idx}')
+        if not cuda_visible:
+            print(f"[VLM][Rank {local_rank}] Warning: CUDA_VISIBLE_DEVICES가 설정되지 않았습니다.")
+            return None
 
-    def initialize(self, uniad_device):
-        """VLM 모델을 지정된 디바이스에 로드.
+        # CUDA_VISIBLE_DEVICES의 물리적 GPU 목록
+        visible_physical_gpus = [int(x.strip()) for x in cuda_visible.split(',') if x.strip()]
+        print(f"[VLM][Rank {local_rank}] CUDA_VISIBLE_DEVICES 내 물리적 GPU: {visible_physical_gpus}")
 
-        Args:
-            uniad_device: UniAD가 실행 중인 디바이스 (VLM 디바이스 결정에 사용)
-        """
+        # VLM이 사용할 수 있는 논리적 인덱스: world_size ~ (len(visible_physical_gpus) - 1)
+        num_visible = len(visible_physical_gpus)
+        num_vlm_gpus = num_visible - world_size
+
+        if num_vlm_gpus <= 0:
+            print(f"[VLM][Rank {local_rank}] Warning: 모든 visible GPU가 학습에 사용 중입니다. "
+                  f"(visible: {num_visible}, world_size: {world_size})")
+            print(f"[VLM][Rank {local_rank}] Warning: VLM GPU를 CUDA_VISIBLE_DEVICES에 추가하세요.")
+            return None
+
+        # 각 rank에 대응하는 VLM GPU 할당
+        # rank 0 -> world_size, rank 1 -> world_size + 1, ...
+        if num_vlm_gpus >= world_size:
+            # VLM GPU가 충분한 경우: 각 rank에 1:1 매핑
+            vlm_logical_idx = world_size + local_rank
+        else:
+            # VLM GPU가 부족한 경우: 라운드 로빈으로 분배
+            vlm_logical_idx = world_size + (local_rank % num_vlm_gpus)
+
+        physical_idx = visible_physical_gpus[vlm_logical_idx]
+        print(f"[VLM][Rank {local_rank}] 할당된 VLM GPU: 논리적 {vlm_logical_idx} (물리적 {physical_idx})")
+
+        # 메모리 확인 (정보 출력용)
+        gpu_memory = get_gpu_memory_info()
+        if gpu_memory:
+            free_mem_mb = gpu_memory.get(physical_idx, 0)
+            print(f"[VLM][Rank {local_rank}] GPU {physical_idx} 메모리: {free_mem_mb}MB free")
+            if free_mem_mb < min_memory_gb * 1024:
+                print(f"[VLM][Rank {local_rank}] Warning: 메모리가 {min_memory_gb}GB 미만입니다.")
+
+        return vlm_logical_idx
+
+    def initialize(self):
+        """VLM 모델을 지정된 디바이스에 로드."""
         if self._initialized:
             return
 
-        device = self._get_vlm_device(uniad_device)
-        print(f"[VLM] Loading {self.model_id} on {device}...")
+        local_rank = int(os.environ.get('LOCAL_RANK', 0))
 
-        # CPU에서는 float32, GPU에서는 float16
-        dtype = torch.float32 if device.type == 'cpu' else torch.float16
+        # 디바이스 결정
+        if self.vlm_device == 'cpu':
+            logical_gpu_idx = None
+            dtype = torch.float32
+        elif isinstance(self.vlm_device, int):
+            # 특정 논리적 GPU 인덱스가 지정된 경우
+            logical_gpu_idx = self.vlm_device
+            dtype = torch.float16
+        elif isinstance(self.vlm_device, str) and self.vlm_device.isdigit():
+            logical_gpu_idx = int(self.vlm_device)
+            dtype = torch.float16
+        else:  # 'auto'
+            logical_gpu_idx = self._find_available_vlm_gpu()
+            dtype = torch.float16 if logical_gpu_idx is not None else torch.float32
+
+        if logical_gpu_idx is None:
+            print(f"[VLM][Rank {local_rank}] Warning: 사용 가능한 GPU가 없습니다. CPU에서 실행합니다.")
+            device = torch.device('cpu')
+            dtype = torch.float32
+        else:
+            device = torch.device(f'cuda:{logical_gpu_idx}')
+            print(f"[VLM][Rank {local_rank}] 논리적 GPU {logical_gpu_idx}에 VLM 로드 중...")
+
+        print(f"[VLM][Rank {local_rank}] Loading {self.model_id} on {device}...")
 
         self.model = LlavaForConditionalGeneration.from_pretrained(
             self.model_id,
             torch_dtype=dtype,
         ).to(device)
-        self.model.eval()  # 추론 모드
+
+        self.model.eval()
 
         tokenizer = AutoTokenizer.from_pretrained(self.model_id, use_fast=False)
         self.processor = AutoProcessor.from_pretrained(self.model_id, tokenizer=tokenizer)
@@ -94,7 +231,7 @@ class VLMInferenceManager:
         self._device = device
         self._dtype = dtype
         self._initialized = True
-        print(f"[VLM] Model loaded successfully on {device}")
+        print(f"[VLM][Rank {local_rank}] Model loaded successfully on {device}")
 
     def _preprocess_tensor_image(self, img_tensor, img_norm_cfg):
         """정규화된 이미지 텐서를 VLM 입력용 PIL 이미지로 변환.
@@ -242,14 +379,26 @@ class VLMInferenceManager:
         return self.processor.batch_decode(tokens, skip_special_tokens=True)[0]
 
 
-# 전역 VLM 매니저 (싱글톤 패턴으로 모델 중복 로드 방지)
+# 전역 VLM 매니저 (각 DDP rank가 자체 VLM 인스턴스 보유)
+# 각 rank는 서로 다른 GPU에 VLM을 로드
 _vlm_manager = None
+_vlm_lock = None
 
 def get_vlm_manager(vlm_device=None):
-    """전역 VLM 매니저 인스턴스 반환."""
-    global _vlm_manager
-    if _vlm_manager is None:
-        _vlm_manager = VLMInferenceManager(vlm_device=vlm_device)
+    """전역 VLM 매니저 인스턴스 반환.
+
+    DDP 환경에서 각 rank가 자체 VLM 매니저를 가집니다.
+    각 프로세스는 서로 다른 GPU에 VLM을 로드합니다.
+    """
+    global _vlm_manager, _vlm_lock
+
+    import threading
+    if _vlm_lock is None:
+        _vlm_lock = threading.Lock()
+
+    with _vlm_lock:
+        if _vlm_manager is None:
+            _vlm_manager = VLMInferenceManager(vlm_device=vlm_device)
     return _vlm_manager
 
 @DETECTORS.register_module()
@@ -314,15 +463,15 @@ class VlmE2E(UniADTrack):
     def with_seg_head(self):
         return hasattr(self, 'seg_head') and self.seg_head is not None
 
-    def _ensure_vlm_initialized(self, uniad_device):
+    def _ensure_vlm_initialized(self):
         """VLM이 초기화되지 않았으면 초기화 (lazy initialization).
 
         DDP 환경에서 각 프로세스가 처음 forward할 때 VLM을 로드합니다.
-        이렇게 하면 모델 생성 시점이 아닌 실제 사용 시점에 GPU를 할당할 수 있습니다.
+        학습 GPU를 자동으로 감지하고 남는 GPU에 VLM을 할당합니다.
         """
         if not self._vlm_initialized:
             vlm_manager = get_vlm_manager(vlm_device=self._vlm_device)
-            vlm_manager.initialize(uniad_device)
+            vlm_manager.initialize()
             self._vlm_initialized = True
 
     def _run_vlm_inference(self, front_img_tensor, img_metas, target_device):
@@ -339,7 +488,7 @@ class VlmE2E(UniADTrack):
         Returns:
             dict: VLM 추론 결과 (embedding, tokens, text)
         """
-        self._ensure_vlm_initialized(front_img_tensor.device)
+        self._ensure_vlm_initialized()
 
         vlm_manager = get_vlm_manager()
 

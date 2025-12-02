@@ -80,6 +80,8 @@ model = dict(
     num_classes=10,
     vehicle_id_list=vehicle_id_list,
     pc_range=point_cloud_range,
+    # VLM 설정: 'auto'면 학습 GPU 외 남는 GPU 자동 선택
+    vlm_device='auto',
     img_backbone=dict(
         type="ResNet",
         depth=101,
@@ -699,7 +701,7 @@ runner = dict(type="EpochBasedRunner", max_epochs=total_epochs)
 log_config = dict(
     interval=10, hooks=[dict(type="TextLoggerHook"), dict(type="TensorboardLoggerHook")]
 )
-checkpoint_config = dict(by_epoch=False, interval=100)
+checkpoint_config = dict(by_epoch=False, interval=10)
 load_from = "ckpts/uniad_base_track_map.pth"
 
 find_unused_parameters = True
