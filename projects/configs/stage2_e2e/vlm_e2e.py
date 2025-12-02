@@ -699,7 +699,7 @@ runner = dict(type="EpochBasedRunner", max_epochs=total_epochs)
 log_config = dict(
     interval=10, hooks=[dict(type="TextLoggerHook"), dict(type="TensorboardLoggerHook")]
 )
-checkpoint_config = dict(interval=1)
+checkpoint_config = dict(by_epoch=False, interval=100)
 load_from = "ckpts/uniad_base_track_map.pth"
 
 find_unused_parameters = True
