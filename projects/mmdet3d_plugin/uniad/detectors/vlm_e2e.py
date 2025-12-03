@@ -462,6 +462,12 @@ class VlmE2E(UniADTrack):
         self._vlm_max_tokens = vlm_max_tokens
         self._vlm_initialized = False
 
+        # Freeze 상태 저장 (forward에서 불필요한 연산 스킵용)
+        self._freeze_seg_head = freeze_seg_head
+        self._freeze_motion_head = freeze_motion_head
+        self._freeze_occ_head = freeze_occ_head
+        self._freeze_planning_head = freeze_planning_head
+
         # Freeze 설정 적용
         self._apply_freeze_settings(
             freeze_seg_head=freeze_seg_head,
@@ -702,27 +708,30 @@ class VlmE2E(UniADTrack):
         img_metas = [each[len_queue-1] for each in img_metas]
 
         outs_seg = dict()
-        if self.with_seg_head:          
+        if self.with_seg_head:
             losses_seg, outs_seg = self.seg_head.forward_train(bev_embed, img_metas,
                                                           gt_lane_labels, gt_lane_bboxes, gt_lane_masks)
-            
-            losses_seg = self.loss_weighted_and_prefixed(losses_seg, prefix='map')
-            losses.update(losses_seg)
+            # Skip loss if frozen
+            if not self._freeze_seg_head:
+                losses_seg = self.loss_weighted_and_prefixed(losses_seg, prefix='map')
+                losses.update(losses_seg)
 
         outs_motion = dict()
         # Forward Motion Head
         if self.with_motion_head:
             ret_dict_motion = self.motion_head.forward_train(bev_embed,
-                                                        gt_bboxes_3d, gt_labels_3d, 
-                                                        gt_fut_traj, gt_fut_traj_mask, 
-                                                        gt_sdc_fut_traj, gt_sdc_fut_traj_mask, 
+                                                        gt_bboxes_3d, gt_labels_3d,
+                                                        gt_fut_traj, gt_fut_traj_mask,
+                                                        gt_sdc_fut_traj, gt_sdc_fut_traj_mask,
                                                         outs_track=outs_track, outs_seg=outs_seg
                                                     )
             losses_motion = ret_dict_motion["losses"]
             outs_motion = ret_dict_motion["outs_motion"]
             outs_motion['bev_pos'] = bev_pos
-            losses_motion = self.loss_weighted_and_prefixed(losses_motion, prefix='motion')
-            losses.update(losses_motion)
+            # Skip loss if frozen
+            if not self._freeze_motion_head:
+                losses_motion = self.loss_weighted_and_prefixed(losses_motion, prefix='motion')
+                losses.update(losses_motion)
 
         # Forward Occ Head
         if self.with_occ_head:
@@ -740,8 +749,10 @@ class VlmE2E(UniADTrack):
                             gt_instance=gt_instance,
                             gt_img_is_valid=gt_occ_img_is_valid,
                         )
-            losses_occ = self.loss_weighted_and_prefixed(losses_occ, prefix='occ')
-            losses.update(losses_occ)
+            # Skip loss if frozen
+            if not self._freeze_occ_head:
+                losses_occ = self.loss_weighted_and_prefixed(losses_occ, prefix='occ')
+                losses.update(losses_occ)
 
         # Forward VLM (별도 GPU에서 실행)
         # img shape: (B, queue_len, num_cams, C, H, W)
@@ -757,9 +768,11 @@ class VlmE2E(UniADTrack):
                 bev_embed, outs_motion, sdc_planning, sdc_planning_mask,
                 command, gt_future_boxes, vlm_embed=vlm_embed
             )
-            losses_planning = outs_planning['losses']
-            losses_planning = self.loss_weighted_and_prefixed(losses_planning, prefix='planning')
-            losses.update(losses_planning)
+            # Skip loss if frozen
+            if not self._freeze_planning_head:
+                losses_planning = outs_planning['losses']
+                losses_planning = self.loss_weighted_and_prefixed(losses_planning, prefix='planning')
+                losses.update(losses_planning)
         
         for k,v in losses.items():
             losses[k] = torch.nan_to_num(v)

@@ -1145,6 +1145,18 @@ class NuScenesE2EDataset(NuScenesDataset):
                             )
                     planning_tab.add_row(row_value)
                 print(planning_tab)
+
+                # Save planning metrics to txt file
+                if jsonfile_prefix is not None:
+                    # pkl 파일과 같은 위치에 저장 (out_file이 전달된 경우)
+                    if hasattr(self, '_planning_metrics_out_path') and self._planning_metrics_out_path:
+                        planning_txt_path = self._planning_metrics_out_path
+                    else:
+                        planning_txt_path = osp.join(osp.dirname(jsonfile_prefix), 'planning_metrics.txt')
+                    with open(planning_txt_path, 'w') as f:
+                        f.write(planning_tab.get_string())
+                        f.write('\n')
+                    print(f"Planning metrics saved to: {planning_txt_path}")
             results = results['bbox_results']  # get bbox_results
 
         result_files, tmp_dir = self.format_results(results, jsonfile_prefix)

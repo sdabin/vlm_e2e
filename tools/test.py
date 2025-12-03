@@ -282,6 +282,11 @@ def main():
                 eval_kwargs.pop(key, None)
             eval_kwargs.update(dict(metric=args.eval, **kwargs))
 
+            # Set planning metrics output path based on --out argument
+            if args.out:
+                planning_txt_path = args.out.replace('.pkl', '_planning_metrics.txt')
+                dataset._planning_metrics_out_path = planning_txt_path
+
             print(dataset.evaluate(outputs, **eval_kwargs))
 
 
