@@ -85,11 +85,12 @@ model = dict(
     vlm_prompt="You are a driving expert. Look at the forward-facing camera image provided, plan your next driving action, and explain in detail why.",
     vlm_max_tokens=1024,
     # Freeze 설정: True로 설정하면 해당 모듈의 파라미터가 학습되지 않음
-    freeze_seg_head=True,      # seg_head (map) freeze
-    freeze_motion_head=True,   # motion_head freeze
-    freeze_occ_head=True,      # occ_head freeze
+    freeze_seg_head=True,       # seg_head (map) freeze
+    freeze_motion_head=True,    # motion_head freeze
+    freeze_occ_head=True,       # occ_head freeze
     freeze_planning_head=False, # planning_head 전체 freeze
-    freeze_vlm_proj=True,      # planning_head 내 vlm_proj만 freeze
+    freeze_vlm_proj=False,      # planning_head 내 vlm_proj만 freeze
+    unfreeze_vlm_proj=False,    # planning_head freeze 시 vlm_proj만 학습 가능하게
     img_backbone=dict(
         type="ResNet",
         depth=101,
@@ -650,8 +651,8 @@ data = dict(
         classes=class_names,
         modality=input_modality,
         samples_per_gpu=1,
-        eval_mod=['det', 'map', 'track','motion'],
-        # eval_mod=['planning'],
+        # eval_mod=['det', 'map', 'track','motion'],
+        eval_mod=['planning'],
 
         occ_receptive_field=3,
         occ_n_future=occ_n_future_max,
@@ -674,8 +675,8 @@ data = dict(
         use_nonlinear_optimizer=use_nonlinear_optimizer,
         classes=class_names,
         modality=input_modality,
-        eval_mod=['det', 'map', 'track','motion'],
-        # eval_mod=['planning'],
+        # eval_mod=['det', 'map', 'track','motion'],
+        eval_mod=['planning'],
     ),
     shuffler_sampler=dict(type="DistributedGroupSampler"),
     nonshuffler_sampler=dict(type="DistributedSampler"),

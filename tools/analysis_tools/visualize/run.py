@@ -2,11 +2,18 @@ import cv2
 import torch
 import argparse
 import os
+import sys
 import glob
 import numpy as np
 import mmcv
 import matplotlib
 import matplotlib.pyplot as plt
+
+# Add project root to path
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
 from nuscenes import NuScenes
 from nuscenes.prediction import PredictHelper, convert_local_coords_to_global
 from nuscenes.utils.geometry_utils import view_points, box_in_image, BoxVisibility, transform_matrix
@@ -42,7 +49,8 @@ class Visualizer:
             show_hd_map=False,
             show_sdc_car=False,
             show_sdc_traj=False,
-            show_legend=False):
+            show_legend=False,
+            show_vlm_text=False):
         self.nusc = NuScenes(version=version, dataroot=dataroot, verbose=True)
         self.predict_helper = PredictHelper(self.nusc)
         self.with_occ_map = with_occ_map
@@ -54,6 +62,7 @@ class Visualizer:
         self.show_sdc_car = show_sdc_car
         self.show_sdc_traj = show_sdc_traj
         self.show_legend = show_legend
+        self.show_vlm_text = show_vlm_text
         self.with_pred_traj = with_pred_traj
         self.with_pred_box = with_pred_box
         self.veh_id_list = [0, 1, 2, 3, 4, 6, 7]
@@ -206,9 +215,23 @@ class Visualizer:
                 predicted_agent_list.append(planning_agent)
             else:
                 planning_agent = None
+
+            # VLM 텍스트 파싱
+            vlm_info = None
+            if self.show_vlm_text:
+                if 'vlm' in outputs[k]:
+                    vlm_info = outputs[k]['vlm']
+                elif 'planning' in outputs[k] and isinstance(outputs[k]['planning'], dict):
+                    if 'vlm_text' in outputs[k]['planning']:
+                        vlm_info = dict(
+                            text=outputs[k]['planning']['vlm_text'],
+                            prompt=outputs[k]['planning'].get('vlm_prompt', '')
+                        )
+
             prediction_dict[token] = dict(predicted_agent_list=predicted_agent_list,
                                           predicted_map_seg=predicted_map_seg,
-                                          predicted_planning=planning_agent)
+                                          predicted_planning=planning_agent,
+                                          vlm_info=vlm_info)
         return prediction_dict
 
     def visualize_bev(self, sample_token, out_filename, t=None):
@@ -255,13 +278,83 @@ class Visualizer:
             self.predictions[sample_token]['predicted_agent_list'], sample_token, self.nusc, render_sdc=self.with_planning)
         self.cam_render.save_fig(out_filename + '_cam.jpg')
 
-    def combine(self, out_filename):
+    def combine(self, out_filename, sample_token=None):
         # pass
         bev_image = cv2.imread(out_filename + '.jpg')
         cam_image = cv2.imread(out_filename + '_cam.jpg')
         merge_image = cv2.hconcat([cam_image, bev_image])
+
+        # VLM 텍스트가 있으면 이미지 하단에 추가
+        if self.show_vlm_text and sample_token is not None:
+            vlm_info = self.predictions[sample_token].get('vlm_info', None)
+            if vlm_info is not None:
+                merge_image = self._add_vlm_text_to_image(merge_image, vlm_info)
+
         cv2.imwrite(out_filename + '.jpg', merge_image)
         os.remove(out_filename + '_cam.jpg')
+
+    def _add_vlm_text_to_image(self, image, vlm_info, max_width_chars=150):
+        """VLM 텍스트를 이미지 하단에 추가합니다."""
+        prompt = vlm_info.get('prompt', '')
+        text = vlm_info.get('text', '')
+
+        if not text:
+            return image
+
+        # 텍스트 설정
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.5
+        font_thickness = 1
+        line_height = 20
+        padding = 10
+        bg_color = (40, 40, 40)  # 어두운 회색 배경
+        prompt_color = (100, 200, 255)  # 주황색 (BGR)
+        text_color = (255, 255, 255)  # 흰색
+
+        # 텍스트 줄바꿈 처리
+        def wrap_text(text, max_chars):
+            words = text.split()
+            lines = []
+            current_line = ""
+            for word in words:
+                if len(current_line) + len(word) + 1 <= max_chars:
+                    current_line += (" " if current_line else "") + word
+                else:
+                    if current_line:
+                        lines.append(current_line)
+                    current_line = word
+            if current_line:
+                lines.append(current_line)
+            return lines
+
+        # 프롬프트와 응답 텍스트 준비
+        prompt_lines = wrap_text(f"[Prompt] {prompt}", max_width_chars) if prompt else []
+        response_lines = wrap_text(f"[VLM Response] {text}", max_width_chars)
+
+        all_lines = prompt_lines + response_lines
+        total_lines = len(all_lines)
+
+        # 텍스트 영역 높이 계산
+        text_area_height = total_lines * line_height + padding * 2
+
+        # 새 이미지 생성 (원본 + 텍스트 영역)
+        h, w = image.shape[:2]
+        new_image = np.zeros((h + text_area_height, w, 3), dtype=np.uint8)
+        new_image[:h, :] = image
+        new_image[h:, :] = bg_color
+
+        # 텍스트 그리기
+        y_offset = h + padding + line_height
+        for i, line in enumerate(all_lines):
+            if i < len(prompt_lines):
+                color = prompt_color
+            else:
+                color = text_color
+            cv2.putText(new_image, line, (padding, y_offset),
+                        font, font_scale, color, font_thickness, cv2.LINE_AA)
+            y_offset += line_height
+
+        return new_image
 
     def to_video(self, folder_path, out_path, fps=4, downsample=1):
         imgs_path = glob.glob(os.path.join(folder_path, '*.jpg'))
@@ -294,7 +387,8 @@ def main(args):
         show_hd_map=False,
         show_sdc_car=True,
         show_legend=True,
-        show_sdc_traj=False
+        show_sdc_traj=False,
+        show_vlm_text=args.show_vlm_text,
     )
 
     viser = Visualizer(version='v1.0-trainval', predroot=args.predroot, dataroot='/home/user/UniAD/data/nuscenes', **render_cfg)
@@ -323,7 +417,7 @@ def main(args):
 
         if args.project_to_cam:
             viser.visualize_cam(sample_token, os.path.join(args.out_folder, str(i).zfill(3)))
-            viser.combine(os.path.join(args.out_folder, str(i).zfill(3)))
+            viser.combine(os.path.join(args.out_folder, str(i).zfill(3)), sample_token=sample_token)
 
     viser.to_video(args.out_folder, args.demo_video, fps=4, downsample=2)
 
@@ -334,5 +428,6 @@ if __name__ == '__main__':
     parser.add_argument('--out_folder', default='/mnt/nas20/yihan01.hu/tmp/viz/demo_test/', help='Output folder path')
     parser.add_argument('--demo_video', default='mini_val_final.avi', help='Demo video name')
     parser.add_argument('--project_to_cam', default=True, help='Project to cam (default: True)')
+    parser.add_argument('--show_vlm_text', action='store_true', help='Show VLM prompt and response text at the bottom of the image')
     args = parser.parse_args()
     main(args)

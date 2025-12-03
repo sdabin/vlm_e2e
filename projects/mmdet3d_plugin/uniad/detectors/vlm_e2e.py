@@ -438,6 +438,7 @@ class VlmE2E(UniADTrack):
         freeze_occ_head=False,
         freeze_planning_head=False,
         freeze_vlm_proj=False,  # planning_head 내의 vlm_proj만 freeze
+        unfreeze_vlm_proj=False,  # planning_head freeze 시 vlm_proj만 학습 가능하게
         **kwargs,
     ):
         super(VlmE2E, self).__init__(**kwargs)
@@ -468,6 +469,7 @@ class VlmE2E(UniADTrack):
             freeze_occ_head=freeze_occ_head,
             freeze_planning_head=freeze_planning_head,
             freeze_vlm_proj=freeze_vlm_proj,
+            unfreeze_vlm_proj=unfreeze_vlm_proj,
         )
 
     def _apply_freeze_settings(
@@ -477,6 +479,7 @@ class VlmE2E(UniADTrack):
         freeze_occ_head=False,
         freeze_planning_head=False,
         freeze_vlm_proj=False,
+        unfreeze_vlm_proj=False,
     ):
         """각 head 모듈의 freeze 설정을 적용합니다."""
 
@@ -491,6 +494,9 @@ class VlmE2E(UniADTrack):
 
         if freeze_planning_head and self.with_planning_head:
             self._freeze_module(self.planning_head, 'planning_head')
+            # planning_head를 freeze했지만 vlm_proj만 학습하고 싶은 경우
+            if unfreeze_vlm_proj and hasattr(self.planning_head, 'vlm_proj'):
+                self._unfreeze_module(self.planning_head.vlm_proj, 'planning_head.vlm_proj')
         elif freeze_vlm_proj and self.with_planning_head:
             # planning_head 전체가 아닌 vlm_proj만 freeze
             if hasattr(self.planning_head, 'vlm_proj'):
@@ -503,6 +509,14 @@ class VlmE2E(UniADTrack):
             param.requires_grad = False
             frozen_count += 1
         print(f"[VlmE2E] Frozen {module_name}: {frozen_count} parameters")
+
+    def _unfreeze_module(self, module, module_name):
+        """모듈의 모든 파라미터를 unfreeze합니다."""
+        unfrozen_count = 0
+        for param in module.parameters():
+            param.requires_grad = True
+            unfrozen_count += 1
+        print(f"[VlmE2E] Unfrozen {module_name}: {unfrozen_count} parameters")
 
     @property
     def with_planning_head(self):
@@ -846,6 +860,13 @@ class VlmE2E(UniADTrack):
         front_img_tensor = img[0]  # 전방 카메라 (C, H, W)
         vlm_output = self._run_vlm_inference(front_img_tensor, img_metas, target_device=bev_embed.device)
         vlm_embed = vlm_output['embedding']
+        vlm_text = vlm_output['text']
+
+        # VLM 출력 저장
+        result[0]['vlm'] = dict(
+            text=vlm_text,
+            prompt=self._vlm_prompt,
+        )
 
         if self.with_planning_head:
             planning_gt=dict(
@@ -860,6 +881,7 @@ class VlmE2E(UniADTrack):
             result[0]['planning'] = dict(
                 planning_gt=planning_gt,
                 result_planning=result_planning,
+                vlm_text=vlm_text,  # planning 결과에도 VLM 텍스트 포함
             )
 
         pop_track_list = ['prev_bev', 'bev_pos', 'bev_embed', 'track_query_embeddings', 'sdc_embedding']

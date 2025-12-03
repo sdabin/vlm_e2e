@@ -94,6 +94,11 @@ def parse_args():
         help='job launcher')
     # parser.add_argument('--local_rank', type=int, default=0)
     parser.add_argument('--local-rank', type=int, default=0)
+    parser.add_argument(
+        '--max-samples',
+        type=int,
+        default=None,
+        help='Maximum number of samples to evaluate. If not specified, evaluate all samples.')
     args = parser.parse_args()
     if 'LOCAL_RANK' not in os.environ:
         os.environ['LOCAL_RANK'] = str(args.local_rank)
@@ -191,6 +196,26 @@ def main():
 
     # build the dataloader
     dataset = build_dataset(cfg.data.test)
+
+    # Limit the number of samples if specified
+    if args.max_samples is not None and args.max_samples > 0:
+        original_len = len(dataset)
+        if args.max_samples < original_len:
+            # Directly truncate the dataset's internal data
+            if hasattr(dataset, 'data_infos'):
+                dataset.data_infos = dataset.data_infos[:args.max_samples]
+            if hasattr(dataset, 'queue'):
+                dataset.queue = dataset.queue[:args.max_samples]
+            if hasattr(dataset, 'flag'):
+                dataset.flag = dataset.flag[:args.max_samples]
+            # Disable tracking evaluation for partial dataset (not supported by nuscenes TrackingEval)
+            if hasattr(dataset, 'eval_mod') and 'track' in dataset.eval_mod:
+                dataset.eval_mod = [m for m in dataset.eval_mod if m != 'track']
+                print(f'[INFO] Disabled tracking evaluation (not supported for partial dataset)')
+            print(f'[INFO] Limiting evaluation to {args.max_samples} samples (original: {original_len})')
+        else:
+            print(f'[INFO] max_samples ({args.max_samples}) >= dataset size ({original_len}), using all samples')
+
     data_loader = build_dataloader(
         dataset,
         samples_per_gpu=samples_per_gpu,

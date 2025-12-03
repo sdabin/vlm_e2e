@@ -513,8 +513,22 @@ class NuScenesEval_custom(NuScenesEval):
                                                      verbose=verbose)
         self.gt_boxes = load_gt(self.nusc, self.eval_set, DetectionBox_modified, verbose=verbose)
 
-        assert set(self.pred_boxes.sample_tokens) == set(self.gt_boxes.sample_tokens), \
-            "Samples in split doesn't match samples in predictions."
+        # Filter GT boxes to match prediction sample tokens (for partial evaluation with --max-samples)
+        pred_sample_tokens = set(self.pred_boxes.sample_tokens)
+        gt_sample_tokens = set(self.gt_boxes.sample_tokens)
+        if pred_sample_tokens != gt_sample_tokens:
+            if pred_sample_tokens.issubset(gt_sample_tokens):
+                # Predictions are a subset of GT - filter GT to match predictions
+                if verbose:
+                    print(f'Filtering GT from {len(gt_sample_tokens)} to {len(pred_sample_tokens)} samples to match predictions')
+                filtered_gt = EvalBoxes()
+                for token in pred_sample_tokens:
+                    filtered_gt.boxes[token] = self.gt_boxes.boxes[token]
+                self.gt_boxes = filtered_gt
+            else:
+                # Some predictions don't have GT - this is an error
+                missing_gt = pred_sample_tokens - gt_sample_tokens
+                raise AssertionError(f"Predictions contain {len(missing_gt)} samples not in GT: {list(missing_gt)[:5]}...")
 
         # Add center distances.
         self.pred_boxes = add_center_dist(nusc, self.pred_boxes)
