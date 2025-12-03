@@ -20,6 +20,8 @@ from projects.mmdet3d_plugin.uniad.apis.test import custom_multi_gpu_test
 from mmdet.datasets import replace_ImageToTensor
 import time
 import os.path as osp
+import torch.multiprocessing as mp
+mp.set_start_method('fork', force=True)
 
 warnings.filterwarnings("ignore")
 

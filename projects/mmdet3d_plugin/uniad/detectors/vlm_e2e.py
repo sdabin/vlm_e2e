@@ -237,7 +237,10 @@ class VLMInferenceManager:
         """정규화된 이미지 텐서를 VLM 입력용 PIL 이미지로 변환.
 
         Args:
-            img_tensor: 정규화된 이미지 텐서 (C, H, W), UniAD GPU에 있음
+            img_tensor: 정규화된 이미지 텐서, 다양한 형태 지원:
+                        - (C, H, W): 단일 이미지
+                        - (1, C, H, W): 배치 크기 1인 이미지
+                        - (N, C, H, W): 첫 번째 이미지만 사용
             img_norm_cfg: 정규화 설정 (mean, std)
 
         Returns:
@@ -245,6 +248,10 @@ class VLMInferenceManager:
         """
         # CPU로 이동 후 역정규화 (UniAD GPU 메모리 해제)
         img = img_tensor.detach().cpu().float()
+
+        # 4D 텐서인 경우 첫 번째 이미지만 사용 (B, C, H, W) -> (C, H, W)
+        if img.dim() == 4:
+            img = img[0]
 
         # 역정규화: img = img * std + mean
         mean = torch.tensor(img_norm_cfg['mean']).view(3, 1, 1)
@@ -443,8 +450,9 @@ class VlmE2E(UniADTrack):
         if planning_head:
             self.planning_head = build_head(planning_head)
 
-        self.task_loss_weight = task_loss_weight
-        assert set(task_loss_weight.keys()) == \
+        # dict로 명시적 변환 (pickle 호환성)
+        self.task_loss_weight = dict(task_loss_weight)
+        assert set(self.task_loss_weight.keys()) == \
                {'track', 'occ', 'motion', 'map', 'planning'}
 
         # VLM 설정 저장 (lazy initialization)
