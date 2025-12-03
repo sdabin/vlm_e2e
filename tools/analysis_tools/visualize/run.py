@@ -293,7 +293,7 @@ class Visualizer:
         cv2.imwrite(out_filename + '.jpg', merge_image)
         os.remove(out_filename + '_cam.jpg')
 
-    def _add_vlm_text_to_image(self, image, vlm_info, max_width_chars=150):
+    def _add_vlm_text_to_image(self, image, vlm_info):
         """VLM 텍스트를 이미지 하단에 추가합니다."""
         prompt = vlm_info.get('prompt', '')
         text = vlm_info.get('text', '')
@@ -301,15 +301,28 @@ class Visualizer:
         if not text:
             return image
 
-        # 텍스트 설정
+        h, w = image.shape[:2]
+
+        # 고정 폰트 설정 (가독성 좋은 크기)
         font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 0.5
-        font_thickness = 1
-        line_height = 20
-        padding = 10
+        font_scale = 2.4
+        font_thickness = 2
+        padding = 30
         bg_color = (40, 40, 40)  # 어두운 회색 배경
         prompt_color = (100, 200, 255)  # 주황색 (BGR)
         text_color = (255, 255, 255)  # 흰색
+
+        # 실제 텍스트 높이 측정
+        (_, text_height), baseline = cv2.getTextSize("Ay", font, font_scale, font_thickness)
+        line_height = text_height + baseline + 15  # 줄 간격 여유
+
+        # 텍스트 영역은 이미지 너비의 95% 사용
+        text_area_width = int(w * 0.90)
+        margin_left = (w - text_area_width) // 2
+
+        # 이미지 너비에 맞는 최대 문자 수 계산
+        (char_width, _), _ = cv2.getTextSize("a", font, font_scale, font_thickness)  # 넓은 문자 기준
+        max_width_chars = 1.1*int(text_area_width / char_width)  # 영역 내에서 98% 사용
 
         # 텍스트 줄바꿈 처리
         def wrap_text(text, max_chars):
@@ -334,23 +347,22 @@ class Visualizer:
         all_lines = prompt_lines + response_lines
         total_lines = len(all_lines)
 
-        # 텍스트 영역 높이 계산
+        # 텍스트 영역 높이 계산 (상하 패딩 포함)
         text_area_height = total_lines * line_height + padding * 2
 
         # 새 이미지 생성 (원본 + 텍스트 영역)
-        h, w = image.shape[:2]
         new_image = np.zeros((h + text_area_height, w, 3), dtype=np.uint8)
         new_image[:h, :] = image
         new_image[h:, :] = bg_color
 
-        # 텍스트 그리기
-        y_offset = h + padding + line_height
+        # 텍스트 그리기 (가운데 정렬)
+        y_offset = h + padding + text_height  # 첫 줄 시작 위치
         for i, line in enumerate(all_lines):
             if i < len(prompt_lines):
                 color = prompt_color
             else:
                 color = text_color
-            cv2.putText(new_image, line, (padding, y_offset),
+            cv2.putText(new_image, line, (margin_left, y_offset),
                         font, font_scale, color, font_thickness, cv2.LINE_AA)
             y_offset += line_height
 
@@ -425,9 +437,25 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--predroot', default='/mnt/nas20/yihan01.hu/tmp/results.pkl', help='Path to results.pkl')
-    parser.add_argument('--out_folder', default='/mnt/nas20/yihan01.hu/tmp/viz/demo_test/', help='Output folder path')
-    parser.add_argument('--demo_video', default='mini_val_final.avi', help='Demo video name')
+    parser.add_argument('--out_folder', default=None, help='Output folder path (default: {predroot_dir}/visual_result)')
+    parser.add_argument('--demo_video', default=None, help='Demo video name (default: {predroot_name}.avi)')
     parser.add_argument('--project_to_cam', default=True, help='Project to cam (default: True)')
-    parser.add_argument('--show_vlm_text', action='store_true', help='Show VLM prompt and response text at the bottom of the image')
+    parser.add_argument('--show_vlm_text', action='store_true', default=True, help='Show VLM prompt and response text at the bottom of the image (default: True)')
+    parser.add_argument('--no_vlm_text', action='store_true', help='Hide VLM prompt and response text')
     args = parser.parse_args()
+
+    # out_folder 기본값: predroot와 같은 폴더의 visual_result
+    if args.out_folder is None:
+        predroot_dir = os.path.dirname(os.path.abspath(args.predroot))
+        args.out_folder = os.path.join(predroot_dir, 'visual_result')
+
+    # demo_video 기본값: predroot 파일명 기반
+    if args.demo_video is None:
+        predroot_name = os.path.splitext(os.path.basename(args.predroot))[0]
+        args.demo_video = f'{predroot_name}.avi'
+
+    # --no_vlm_text가 지정되면 show_vlm_text를 False로
+    if args.no_vlm_text:
+        args.show_vlm_text = False
+
     main(args)

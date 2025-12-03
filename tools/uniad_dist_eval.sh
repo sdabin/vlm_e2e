@@ -53,18 +53,36 @@ fi
 echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
 echo "Work directory: ${WORK_DIR}"
 
-# 기본 결과 파일 경로 (--out이 extra_args에 없으면 사용)
-DEFAULT_OUT="${WORK_DIR}results_${T}.pkl"
+# 기본 결과 파일 경로: checkpoint와 같은 폴더에 저장
+CKPT_DIR=$(dirname "${CKPT}")
+CKPT_NAME=$(basename "${CKPT}" .pth)
 
-# extra_args에 --out이 있는지 확인
+# extra_args 파싱
 EXTRA_ARGS="${@:5}"
-if [[ "$EXTRA_ARGS" == *"--out"* ]]; then
-    OUT_ARG=""
-else
-    OUT_ARG="--out ${DEFAULT_OUT}"
+
+# --max-samples 값 추출
+MAX_SAMPLES=""
+if [[ "$EXTRA_ARGS" =~ --max-samples[[:space:]]+([0-9]+) ]]; then
+    MAX_SAMPLES="${BASH_REMATCH[1]}"
 fi
 
-echo "Results will be saved to: ${OUT_ARG:-'(specified in extra args)'}"
+# 테스트 타입에 따른 파일명 설정
+if [ -n "$MAX_SAMPLES" ]; then
+    TEST_TYPE="quick_test_${MAX_SAMPLES}"
+else
+    TEST_TYPE="complete_test"
+fi
+
+DEFAULT_OUT="${CKPT_DIR}/${CKPT_NAME}_${TEST_TYPE}.pkl"
+
+# extra_args에 --out이 있는지 확인
+if [[ "$EXTRA_ARGS" == *"--out"* ]]; then
+    OUT_ARG=""
+    echo "Results will be saved to: (specified in extra args)"
+else
+    OUT_ARG="--out ${DEFAULT_OUT}"
+    echo "Results will be saved to: ${DEFAULT_OUT}"
+fi
 
 PYTHONPATH="$(dirname $0)/..":$PYTHONPATH \
 python -m torch.distributed.launch \
