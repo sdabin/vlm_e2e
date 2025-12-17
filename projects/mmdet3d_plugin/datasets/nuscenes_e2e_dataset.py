@@ -1153,6 +1153,10 @@ class NuScenesE2EDataset(NuScenesDataset):
                         planning_txt_path = self._planning_metrics_out_path
                     else:
                         planning_txt_path = osp.join(osp.dirname(jsonfile_prefix), 'planning_metrics.txt')
+                    # 디렉토리가 없으면 생성
+                    planning_dir = osp.dirname(planning_txt_path)
+                    if planning_dir and not osp.exists(planning_dir):
+                        os.makedirs(planning_dir, exist_ok=True)
                     with open(planning_txt_path, 'w') as f:
                         f.write(planning_tab.get_string())
                         f.write('\n')
