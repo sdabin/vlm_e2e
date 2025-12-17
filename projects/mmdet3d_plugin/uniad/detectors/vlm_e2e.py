@@ -431,7 +431,7 @@ class VlmE2E(UniADTrack):
         ),
         vlm_device=None,  # VLM GPU 지정 (None=자동, 'cpu'=CPU, 숫자=특정 GPU)
         vlm_prompt="Explain which element visible in the image is the most important for an autonomous vehicle to perform path planning.",
-        vlm_max_tokens=30,
+        vlm_max_tokens=1024,
         # Freeze 옵션들
         freeze_seg_head=False,
         freeze_motion_head=False,

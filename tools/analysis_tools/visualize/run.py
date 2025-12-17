@@ -284,6 +284,12 @@ class Visualizer:
         cam_image = cv2.imread(out_filename + '_cam.jpg')
         merge_image = cv2.hconcat([cam_image, bev_image])
 
+        # Add trajectory comparison graph
+        if self.with_planning and sample_token is not None:
+            traj_graph = self._create_traj_comparison_graph(sample_token, merge_image.shape[1])
+            if traj_graph is not None:
+                merge_image = cv2.vconcat([merge_image, traj_graph])
+
         # VLM 텍스트가 있으면 이미지 하단에 추가
         if self.show_vlm_text and sample_token is not None:
             vlm_info = self.predictions[sample_token].get('vlm_info', None)
@@ -292,6 +298,103 @@ class Visualizer:
 
         cv2.imwrite(out_filename + '.jpg', merge_image)
         os.remove(out_filename + '_cam.jpg')
+
+    def _get_l2g_transform(self, sample_record):
+        """Get lidar to global transform (same as trajectory_api.py)."""
+        lidar_data = self.nusc.get('sample_data', sample_record['data']['LIDAR_TOP'])
+        cs_record = self.nusc.get('calibrated_sensor', lidar_data['calibrated_sensor_token'])
+        pose_record = self.nusc.get('ego_pose', lidar_data['ego_pose_token'])
+
+        l2e_r = cs_record['rotation']
+        l2e_t = np.array(cs_record['translation'])
+        e2g_r = pose_record['rotation']
+        e2g_t = np.array(pose_record['translation'])
+
+        l2e_r_mat = Quaternion(l2e_r).rotation_matrix
+        e2g_r_mat = Quaternion(e2g_r).rotation_matrix
+
+        return l2e_r_mat, l2e_t, e2g_r_mat, e2g_t
+
+    def _get_gt_trajectory(self, sample_token, num_future_steps=6):
+        """Get GT ego trajectory in lidar frame (same method as UniAD's trajectory_api.py)."""
+        sd_rec = self.nusc.get('sample', sample_token)
+        l2e_r_mat_init, l2e_t_init, e2g_r_mat_init, e2g_t_init = self._get_l2g_transform(sd_rec)
+
+        gt_traj = [[0.0, 0.0]]  # Start at origin
+
+        for _ in range(num_future_steps):
+            next_token = sd_rec['next']
+            if next_token == '':
+                break
+            sd_rec = self.nusc.get('sample', next_token)
+            l2e_r_mat_curr, l2e_t_curr, e2g_r_mat_curr, e2g_t_curr = self._get_l2g_transform(sd_rec)
+
+            # Future ego position in current lidar frame
+            # Step 1: Get future ego position in global frame
+            future_pos_global = e2g_t_curr.copy()
+
+            # Step 2: Transform to initial ego frame
+            future_pos_ego = np.linalg.inv(e2g_r_mat_init) @ (future_pos_global - e2g_t_init)
+
+            # Step 3: Transform to initial lidar frame
+            future_pos_lidar = np.linalg.inv(l2e_r_mat_init) @ (future_pos_ego - l2e_t_init)
+
+            gt_traj.append([future_pos_lidar[0], future_pos_lidar[1]])
+
+        return np.array(gt_traj)
+
+    def _create_traj_comparison_graph(self, sample_token, target_width):
+        """Create trajectory comparison graph as image."""
+        # Get planner trajectory
+        planning_agent = self.predictions[sample_token].get('predicted_planning')
+        if planning_agent is None:
+            return None
+
+        planning_traj = planning_agent.pred_traj
+        planning_traj_full = np.vstack([[0, 0], planning_traj])
+
+        # Get GT trajectory
+        gt_traj = self._get_gt_trajectory(sample_token, num_future_steps=len(planning_traj))
+
+        # Create matplotlib figure
+        fig, axes = plt.subplots(1, 2, figsize=(14, 2.8))
+
+        t_gt = np.arange(len(gt_traj))
+        t_plan = np.arange(len(planning_traj_full))
+
+        # X coordinate (forward, positive = forward)
+        axes[0].plot(t_gt, gt_traj[:, 1], 'g-o', label='GT', linewidth=2, markersize=8)
+        axes[0].plot(t_plan, planning_traj_full[:, 1], 'r-o', label='Planner', linewidth=2, markersize=8)
+        axes[0].set_xlabel('Time Step', fontsize=12)
+        axes[0].set_ylabel('X (forward) [m]', fontsize=12)
+        axes[0].set_title('X Coordinate', fontsize=14)
+        axes[0].legend(fontsize=11)
+        axes[0].grid(True, alpha=0.3)
+
+        # Y coordinate (lateral, positive = left)
+        axes[1].plot(t_gt, gt_traj[:, 0], 'g-o', label='GT', linewidth=2, markersize=8)
+        axes[1].plot(t_plan, planning_traj_full[:, 0], 'r-o', label='Planner', linewidth=2, markersize=8)
+        axes[1].set_xlabel('Time Step', fontsize=12)
+        axes[1].set_ylabel('Y (left) [m]', fontsize=12)
+        axes[1].set_title('Y Coordinate', fontsize=14)
+        axes[1].legend(fontsize=11)
+        axes[1].grid(True, alpha=0.3)
+
+        plt.tight_layout()
+
+        # Convert to image
+        fig.canvas.draw()
+        graph_image = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+        graph_image = graph_image.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+        graph_image = cv2.cvtColor(graph_image, cv2.COLOR_RGB2BGR)
+        plt.close(fig)
+
+        # Resize to match target width
+        h, w = graph_image.shape[:2]
+        new_h = int(h * target_width / w)
+        graph_image = cv2.resize(graph_image, (target_width, new_h))
+
+        return graph_image
 
     def _add_vlm_text_to_image(self, image, vlm_info):
         """VLM 텍스트를 이미지 하단에 추가합니다."""
@@ -303,7 +406,7 @@ class Visualizer:
 
         h, w = image.shape[:2]
 
-        # 고정 폰트 설정 (가독성 좋은 크기)
+        # 폰트 설정 (가독성 좋은 작은 크기)
         font = cv2.FONT_HERSHEY_SIMPLEX
         font_scale = 2.4
         font_thickness = 2
@@ -317,12 +420,12 @@ class Visualizer:
         line_height = text_height + baseline + 15  # 줄 간격 여유
 
         # 텍스트 영역은 이미지 너비의 95% 사용
-        text_area_width = int(w * 0.90)
+        text_area_width = int(w * 0.95)
         margin_left = (w - text_area_width) // 2
 
         # 이미지 너비에 맞는 최대 문자 수 계산
-        (char_width, _), _ = cv2.getTextSize("a", font, font_scale, font_thickness)  # 넓은 문자 기준
-        max_width_chars = 1.1*int(text_area_width / char_width)  # 영역 내에서 98% 사용
+        (char_width, _), _ = cv2.getTextSize("a", font, font_scale, font_thickness)
+        max_width_chars = int(text_area_width / char_width)
 
         # 텍스트 줄바꿈 처리
         def wrap_text(text, max_chars):
