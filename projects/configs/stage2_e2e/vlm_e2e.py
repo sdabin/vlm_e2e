@@ -83,14 +83,14 @@ model = dict(
     # VLM 설정: 'auto'면 학습 GPU 외 남는 GPU 자동 선택
     vlm_device='auto',
     vlm_prompt="You are a driving expert. Look at the forward-facing camera image provided, plan your next driving action, and explain in detail why.",
-    vlm_max_tokens=1024,
+    vlm_max_tokens=512,
     # Freeze 설정: True로 설정하면 해당 모듈의 파라미터가 학습되지 않음
-    freeze_seg_head=True,       # seg_head (map) freeze
-    freeze_motion_head=True,    # motion_head freeze
-    freeze_occ_head=True,       # occ_head freeze
+    freeze_seg_head=False,       # seg_head (map) freeze
+    freeze_motion_head=False,    # motion_head freeze
+    freeze_occ_head=False,       # occ_head freeze
     freeze_planning_head=False, # planning_head 전체 freeze
-    freeze_vlm_proj=True,      # planning_head 내 vlm_proj만 freeze
-    unfreeze_vlm_proj=False,    # planning_head freeze 시 vlm_proj만 학습 가능하게
+    freeze_vlm_proj=False,      # planning_head 내 vlm_proj만 freeze
+    unfreeze_vlm_proj=True,    # planning_head freeze 시 vlm_proj만 학습 가능하게
     img_backbone=dict(
         type="ResNet",
         depth=101,
@@ -711,7 +711,7 @@ log_config = dict(
     interval=10, hooks=[dict(type="TextLoggerHook"), dict(type="TensorboardLoggerHook")]
 )
 checkpoint_config = dict(by_epoch=False, interval=100)
-# load_from = "ckpts/uniad_base_track_map.pth"
-load_from = "ckpts/uniad_base_e2e.pth"
+load_from = "ckpts/uniad_base_track_map.pth"
+# load_from = "ckpts/uniad_base_e2e.pth"
 
 find_unused_parameters = True

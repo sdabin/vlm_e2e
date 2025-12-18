@@ -261,6 +261,11 @@ class VLMInferenceManager:
         # (C, H, W) -> (H, W, C), [0, 255] uint8로 변환
         img = img.permute(1, 2, 0).clamp(0, 255).to(torch.uint8).numpy()
 
+        # BGR -> RGB 변환 (to_rgb=False인 경우 이미지가 BGR 포맷)
+        # LLaVA는 RGB 이미지를 기대하므로 채널 순서 변환 필요
+        if not img_norm_cfg.get('to_rgb', True):
+            img = img[:, :, ::-1].copy()
+
         return Image.fromarray(img)
 
     def _prepare_inputs(self, img_tensor, text, img_norm_cfg=None):
