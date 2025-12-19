@@ -159,22 +159,24 @@ class VLMInferenceManager:
         num_vlm_gpus = num_visible - world_size
 
         if num_vlm_gpus <= 0:
-            print(f"[VLM][Rank {local_rank}] Warning: 모든 visible GPU가 학습에 사용 중입니다. "
+            # 별도 VLM GPU가 없으면, 학습과 같은 GPU 사용 (H200 등 대용량 GPU에서 가능)
+            print(f"[VLM][Rank {local_rank}] 별도 VLM GPU 없음. 학습 GPU와 공유합니다. "
                   f"(visible: {num_visible}, world_size: {world_size})")
-            print(f"[VLM][Rank {local_rank}] Warning: VLM GPU를 CUDA_VISIBLE_DEVICES에 추가하세요.")
-            return None
-
-        # 각 rank에 대응하는 VLM GPU 할당
-        # rank 0 -> world_size, rank 1 -> world_size + 1, ...
-        if num_vlm_gpus >= world_size:
-            # VLM GPU가 충분한 경우: 각 rank에 1:1 매핑
-            vlm_logical_idx = world_size + local_rank
+            vlm_logical_idx = local_rank
+            physical_idx = visible_physical_gpus[vlm_logical_idx]
+            print(f"[VLM][Rank {local_rank}] 학습 GPU 공유: 논리적 {vlm_logical_idx} (물리적 {physical_idx})")
         else:
-            # VLM GPU가 부족한 경우: 라운드 로빈으로 분배
-            vlm_logical_idx = world_size + (local_rank % num_vlm_gpus)
+            # 각 rank에 대응하는 VLM GPU 할당
+            # rank 0 -> world_size, rank 1 -> world_size + 1, ...
+            if num_vlm_gpus >= world_size:
+                # VLM GPU가 충분한 경우: 각 rank에 1:1 매핑
+                vlm_logical_idx = world_size + local_rank
+            else:
+                # VLM GPU가 부족한 경우: 라운드 로빈으로 분배
+                vlm_logical_idx = world_size + (local_rank % num_vlm_gpus)
 
-        physical_idx = visible_physical_gpus[vlm_logical_idx]
-        print(f"[VLM][Rank {local_rank}] 할당된 VLM GPU: 논리적 {vlm_logical_idx} (물리적 {physical_idx})")
+            physical_idx = visible_physical_gpus[vlm_logical_idx]
+            print(f"[VLM][Rank {local_rank}] 할당된 VLM GPU: 논리적 {vlm_logical_idx} (물리적 {physical_idx})")
 
         # 메모리 확인 (정보 출력용)
         gpu_memory = get_gpu_memory_info()

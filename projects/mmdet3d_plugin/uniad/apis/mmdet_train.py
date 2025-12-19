@@ -126,8 +126,16 @@ def custom_train_detector(model,
     # fp16 setting
     fp16_cfg = cfg.get('fp16', None)
     if fp16_cfg is not None:
-        optimizer_config = Fp16OptimizerHook(
-            **cfg.optimizer_config, **fp16_cfg, distributed=distributed)
+        # Check if gradient accumulation is requested
+        if cfg.optimizer_config.get('type') == 'GradientCumulativeOptimizerHook':
+            from mmcv.runner import GradientCumulativeFp16OptimizerHook
+            opt_cfg = cfg.optimizer_config.copy()
+            opt_cfg.pop('type')
+            optimizer_config = GradientCumulativeFp16OptimizerHook(
+                **opt_cfg, **fp16_cfg, distributed=distributed)
+        else:
+            optimizer_config = Fp16OptimizerHook(
+                **cfg.optimizer_config, **fp16_cfg, distributed=distributed)
     elif distributed and 'type' not in cfg.optimizer_config:
         optimizer_config = OptimizerHook(**cfg.optimizer_config)
     else:

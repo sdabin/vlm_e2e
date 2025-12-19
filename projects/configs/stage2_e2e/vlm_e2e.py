@@ -485,6 +485,7 @@ model = dict(
 )
 dataset_type = "NuScenesE2EDataset"
 data_root = "data/nuscenes/"
+img_root = ""  # info 파일에 이미 ./data/nuscenes/ 경로가 포함됨
 info_root = "data/infos/"
 file_client_args = dict(backend="disk")
 ann_file_train=info_root + f"nuscenes_infos_temporal_train.pkl"
@@ -493,7 +494,7 @@ ann_file_test=info_root + f"nuscenes_infos_temporal_val.pkl"
 
 
 train_pipeline = [
-    dict(type="LoadMultiViewImageFromFilesInCeph", to_float32=True, file_client_args=file_client_args, img_root=data_root),
+    dict(type="LoadMultiViewImageFromFilesInCeph", to_float32=True, file_client_args=file_client_args, img_root=img_root),
     dict(type="PhotoMetricDistortionMultiViewImage"),
     dict(
         type="LoadAnnotations3D_E2E",
@@ -556,7 +557,7 @@ train_pipeline = [
 ]
 test_pipeline = [
     dict(type='LoadMultiViewImageFromFilesInCeph', to_float32=True,
-            file_client_args=file_client_args, img_root=data_root),
+            file_client_args=file_client_args, img_root=img_root),
     dict(type="NormalizeMultiviewImage", **img_norm_cfg),
     dict(type="PadMultiViewImage", size_divisor=32),
     dict(type='LoadAnnotations3D_E2E', 
@@ -607,7 +608,9 @@ test_pipeline = [
 ]
 data = dict(
     samples_per_gpu=1,
-    workers_per_gpu=2,
+    workers_per_gpu=16,
+    persistent_workers=False,
+    prefetch_factor=4,
     train=dict(
         type=dataset_type,
         file_client_args=file_client_args,
