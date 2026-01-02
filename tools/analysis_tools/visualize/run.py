@@ -68,6 +68,11 @@ class Visualizer:
         self.veh_id_list = [0, 1, 2, 3, 4, 6, 7]
         self.use_json = '.json' in predroot
         self.token_set = set()
+        self.is_curated_format = False  # Flag for curated pkl format
+
+        # Build scene mapping for curated format support
+        self._build_scene_mapping()
+
         self.predictions = self._parse_predictions_multitask_pkl(predroot)
         self.bev_render = BEVRender(show_gt_boxes=show_gt_boxes)
         self.cam_render = CameraRender(show_gt_boxes=show_gt_boxes)
@@ -80,14 +85,85 @@ class Visualizer:
                 'singapore-queenstown': NuScenesMap(dataroot=dataroot, map_name='singapore-queenstown'),
             }
 
+    def _build_scene_mapping(self):
+        """Build mapping from scene_id (e.g., '089') to nuScenes scene and its samples."""
+        # Map scene_id to scene_token
+        self.scene_id_to_token = {}
+        for scene in self.nusc.scene:
+            # Extract number from scene name like "scene-0089"
+            scene_num = scene['name'].split('-')[1]  # "0089"
+            scene_id = scene_num.lstrip('0') or '0'  # "89" or "0"
+            # Also store with leading zeros for flexibility
+            self.scene_id_to_token[scene_id] = scene['token']
+            self.scene_id_to_token[scene_num] = scene['token']
+
+        # Map scene_token to ordered list of sample_tokens
+        self.scene_to_samples = {}
+        for scene in self.nusc.scene:
+            samples = []
+            sample_token = scene['first_sample_token']
+            while sample_token:
+                samples.append(sample_token)
+                sample = self.nusc.get('sample', sample_token)
+                sample_token = sample['next']
+            self.scene_to_samples[scene['token']] = samples
+
+    def _parse_curated_token(self, token):
+        """Parse curated token format: {hash}-{scene_id}_{timestamp}_{frame_idx}
+        Returns: (nusc_sample_token, scene_id, frame_idx) or (None, None, None) if invalid
+        """
+        if '-' not in token:
+            return None, None, None
+
+        parts = token.split('-')
+        if len(parts) != 2:
+            return None, None, None
+
+        suffix_parts = parts[1].split('_')
+        if len(suffix_parts) < 3:
+            return None, None, None
+
+        scene_id = suffix_parts[0]  # e.g., "089"
+        frame_idx = int(suffix_parts[2])  # e.g., 0, 1, 2, ...
+
+        # Map scene_id to nuScenes scene_token
+        scene_token = self.scene_id_to_token.get(scene_id)
+        if scene_token is None:
+            return None, None, None
+
+        # Get the sample_token for this frame in the scene
+        samples = self.scene_to_samples.get(scene_token, [])
+        if frame_idx >= len(samples):
+            return None, None, None
+
+        nusc_sample_token = samples[frame_idx]
+        return nusc_sample_token, scene_id, frame_idx
+
     def _parse_predictions_multitask_pkl(self, predroot):
 
         outputs = mmcv.load(predroot)
         outputs = outputs['bbox_results']
         prediction_dict = dict()
+
+        # Check if this is curated format by examining first token
+        if len(outputs) > 0:
+            first_token = outputs[0]['token']
+            if '-' in first_token and '_' in first_token.split('-')[1]:
+                self.is_curated_format = True
+                print(f"Detected curated pkl format")
+
         for k in range(len(outputs)):
             token = outputs[k]['token']
-            self.token_set.add(token)
+
+            # Handle curated token format: {hash}-{scene_id}_{timestamp}_{frame_idx}
+            if self.is_curated_format:
+                sample_token, scene_id, frame_idx = self._parse_curated_token(token)
+                if sample_token is None:
+                    continue  # Skip invalid tokens
+            else:
+                sample_token = token
+
+            self.token_set.add(sample_token)
             if self.show_sdc_traj:
                 outputs[k]['boxes_3d'].tensor = torch.cat(
                     [outputs[k]['boxes_3d'].tensor, outputs[k]['sdc_boxes_3d'].tensor], dim=0)
@@ -228,7 +304,7 @@ class Visualizer:
                             prompt=outputs[k]['planning'].get('vlm_prompt', '')
                         )
 
-            prediction_dict[token] = dict(predicted_agent_list=predicted_agent_list,
+            prediction_dict[sample_token] = dict(predicted_agent_list=predicted_agent_list,
                                           predicted_map_seg=predicted_map_seg,
                                           predicted_planning=planning_agent,
                                           vlm_info=vlm_info)
@@ -474,7 +550,11 @@ class Visualizer:
     def to_video(self, folder_path, out_path, fps=4, downsample=1):
         imgs_path = glob.glob(os.path.join(folder_path, '*.jpg'))
         imgs_path = sorted(imgs_path)
+        if len(imgs_path) == 0:
+            print(f"No images found in {folder_path}, skipping video creation")
+            return
         img_array = []
+        size = None
         for img_path in imgs_path:
             img = cv2.imread(img_path)
             height, width, channel = img.shape
@@ -517,23 +597,45 @@ def main(args):
     for i in range(len(viser.nusc.scene)):
         scene_token_to_name[viser.nusc.scene[i]['token']] = viser.nusc.scene[i]['name']
 
+    # Track frame index per scene
+    scene_frame_counter = dict()
+    processed_count = 0
+
     for i in range(len(viser.nusc.sample)):
         sample_token = viser.nusc.sample[i]['token']
         scene_token = viser.nusc.sample[i]['scene_token']
 
-        if scene_token_to_name[scene_token] not in val_splits:
-            continue
+        # For curated format, skip validation split check
+        # For standard format, only process validation samples
+        if not viser.is_curated_format:
+            if scene_token_to_name[scene_token] not in val_splits:
+                continue
 
         if sample_token not in viser.token_set:
-            print(i, sample_token, 'not in prediction pkl!')
+            if not viser.is_curated_format:
+                print(i, sample_token, 'not in prediction pkl!')
             continue
 
-        viser.visualize_bev(sample_token, os.path.join(args.out_folder, str(i).zfill(3)))
+        # Get frame index for this scene
+        if scene_token not in scene_frame_counter:
+            scene_frame_counter[scene_token] = 0
+        frame_idx = scene_frame_counter[scene_token]
+        scene_frame_counter[scene_token] += 1
+
+        # Output filename: {scene_token}_{frame_idx}
+        out_filename = os.path.join(args.out_folder, f"{scene_token}_{frame_idx}")
+
+        viser.visualize_bev(sample_token, out_filename)
 
         if args.project_to_cam:
-            viser.visualize_cam(sample_token, os.path.join(args.out_folder, str(i).zfill(3)))
-            viser.combine(os.path.join(args.out_folder, str(i).zfill(3)), sample_token=sample_token)
+            viser.visualize_cam(sample_token, out_filename)
+            viser.combine(out_filename, sample_token=sample_token)
 
+        processed_count += 1
+        if processed_count % 100 == 0:
+            print(f"Processed {processed_count} samples...")
+
+    print(f"Total processed: {processed_count} samples")
     viser.to_video(args.out_folder, args.demo_video, fps=4, downsample=2)
 
 
