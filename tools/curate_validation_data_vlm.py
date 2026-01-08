@@ -31,6 +31,7 @@ import argparse
 import pickle
 import os
 import re
+import tempfile
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from datetime import datetime
@@ -46,6 +47,64 @@ def get_vlm_imports():
     import torch
     from transformers import AutoProcessor, AutoTokenizer
     return torch, AutoProcessor, AutoTokenizer
+
+
+# ============================================================================
+# Video Conversion Utilities
+# ============================================================================
+
+def images_to_video(image_paths: List[str], output_path: Optional[str] = None, fps: float = 2.0) -> str:
+    """
+    여러 이미지를 비디오 파일로 변환
+    
+    Args:
+        image_paths: 이미지 파일 경로 리스트 (시간순: 과거 -> 현재)
+        output_path: 출력 비디오 경로 (None이면 임시 파일 생성)
+        fps: 비디오 프레임레이트
+        
+    Returns:
+        비디오 파일 경로
+    """
+    try:
+        import cv2
+    except ImportError:
+        raise ImportError("opencv-python is required for video conversion. Install with: pip install opencv-python")
+    
+    if not image_paths:
+        raise ValueError("image_paths cannot be empty")
+    
+    # 첫 번째 이미지로 크기 확인
+    first_img = cv2.imread(image_paths[0])
+    if first_img is None:
+        raise ValueError(f"Failed to read image: {image_paths[0]}")
+    
+    height, width, _ = first_img.shape
+    
+    # 출력 경로 설정
+    if output_path is None:
+        fd, output_path = tempfile.mkstemp(suffix='.mp4')
+        os.close(fd)
+    
+    # 비디오 writer 생성
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    
+    try:
+        for img_path in image_paths:
+            img = cv2.imread(img_path)
+            if img is None:
+                print(f"Warning: Failed to read image {img_path}, skipping")
+                continue
+            
+            # 크기 맞추기 (resize if needed)
+            if img.shape[:2] != (height, width):
+                img = cv2.resize(img, (width, height))
+            
+            out.write(img)
+    finally:
+        out.release()
+    
+    return output_path
 
 
 # ============================================================================
@@ -93,9 +152,16 @@ class VLMInterface(ABC):
         pass
 
     @abstractmethod
-    def generate(self, image: Image.Image, prompt: str, max_new_tokens: int = 2048) -> Dict[str, Any]:
+    def generate(self, image: Image.Image, prompt: str, max_new_tokens: int = 2048,
+                 image_paths: Optional[List[str]] = None) -> Dict[str, Any]:
         """
         이미지와 프롬프트로 응답 생성
+        
+        Args:
+            image: 현재 프레임 이미지 (PIL Image)
+            prompt: 프롬프트 텍스트
+            max_new_tokens: 최대 생성 토큰 수
+            image_paths: 이미지 경로 리스트 (첫 번째는 현재, 나머지는 과거 프레임)
 
         Returns:
             {'text': str, 'token_ids': list}
@@ -138,42 +204,82 @@ class LLaVAModel(VLMInterface):
         dtype = torch.float16 if self.dtype == "float16" else torch.float32
 
         print(f"Loading LLaVA model: {self.model_id}")
-        self.model = LlavaForConditionalGeneration.from_pretrained(
-            self.model_id,
-            torch_dtype=dtype,
-            device_map=self.device if self.device == "auto" else None,
-        )
-        if self.device != "auto":
-            self.model = self.model.to(self.device)
+
+        # Multi-GPU support (same as Qwen2.5-VL)
+        if self.is_multi_gpu:
+            if isinstance(self.device_map, list):
+                # Create device map for specific GPUs
+                max_memory = {gpu_id: "24GiB" for gpu_id in self.device_map}
+                print(f"  Multi-GPU mode: GPUs {self.device_map}")
+                self.model = LlavaForConditionalGeneration.from_pretrained(
+                    self.model_id,
+                    torch_dtype=dtype,
+                    device_map="auto",
+                    max_memory=max_memory,
+                )
+            else:
+                # Auto device map
+                print(f"  Auto device map mode")
+                self.model = LlavaForConditionalGeneration.from_pretrained(
+                    self.model_id,
+                    torch_dtype=dtype,
+                    device_map="auto",
+                )
+        else:
+            # Single GPU
+            print(f"  Single GPU mode: {self.device}")
+            self.model = LlavaForConditionalGeneration.from_pretrained(
+                self.model_id,
+                torch_dtype=dtype,
+            )
+            if self.device != "auto":
+                self.model = self.model.to(self.device)
 
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_id, use_fast=False)
         self.processor = AutoProcessor.from_pretrained(self.model_id, tokenizer=self.tokenizer)
 
-        print(f"LLaVA model loaded on {self.device}")
+        print(f"LLaVA model loaded (dtype: {dtype})")
 
-    def generate(self, image: Image.Image, prompt: str, max_new_tokens: int = 2048) -> Dict[str, Any]:
+    def generate(self, image: Image.Image, prompt: str, max_new_tokens: int = 2048,
+                 image_paths: Optional[List[str]] = None, use_video: bool = False,
+                 system_prompt: Optional[str] = None) -> Dict[str, Any]:
         torch, _, _ = get_vlm_imports()
 
         # LLaVA conversation format
-        conversation = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image"},
-                    {"type": "text", "text": prompt},
-                ],
-            },
-        ]
+        # LLaVA는 여러 이미지를 지원하지만, 현재 구현은 단일 이미지만 지원
+        # 여러 이미지가 제공되면 첫 번째 이미지만 사용
+        # use_video는 LLaVA에서 무시됨
+        content = [{"type": "image"}]
+        if image_paths and len(image_paths) > 1:
+            # 여러 이미지가 있는 경우, 첫 번째만 사용 (LLaVA는 단일 이미지 처리)
+            print(f"  Warning: LLaVA supports single image only. Using first image from {len(image_paths)} images.")
+        content.append({"type": "text", "text": prompt})
+
+        conversation = []
+
+        # System role 추가 (선택적)
+        if system_prompt:
+            conversation.append({
+                "role": "system",
+                "content": [{"type": "text", "text": system_prompt}]
+            })
+
+        # User role 추가
+        conversation.append({
+            "role": "user",
+            "content": content,
+        })
 
         # Apply chat template
         text_prompt = self.processor.apply_chat_template(conversation, add_generation_prompt=True)
 
-        # Process inputs
+        # Process inputs - use get_model_device() for multi-GPU support
+        device = self.get_model_device()
         inputs = self.processor(
             images=image,
             text=text_prompt,
             return_tensors="pt"
-        ).to(self.model.device)
+        ).to(device)
 
         # Generate
         with torch.no_grad():
@@ -247,31 +353,62 @@ class Qwen25VLModel(VLMInterface):
         print(f"Qwen2.5-VL model loaded (dtype: {dtype})")
 
     def generate(self, image: Image.Image, prompt: str, max_new_tokens: int = 2048,
-                 image_path: str = None) -> Dict[str, Any]:
+                 image_paths: Optional[List[str]] = None, use_video: bool = True,
+                 system_prompt: Optional[str] = None) -> Dict[str, Any]:
         """
         Generate response from image and prompt.
+
+        Args:
+            image: 현재 프레임 이미지 (PIL Image)
+            prompt: 프롬프트 텍스트
+            max_new_tokens: 최대 생성 토큰 수
+            image_paths: 이미지 경로 리스트 (첫 번째는 과거, 마지막은 현재 프레임)
+            use_video: True면 여러 이미지를 비디오로 변환하여 전달 (dynamic FPS sampling 활용)
+            system_prompt: System role 메시지 (선택적)
         """
         torch, _, _ = get_vlm_imports()
         from qwen_vl_utils import process_vision_info
 
-        # Use file path if provided
-        if image_path:
-            image_content = {"type": "image", "image": image_path}
+        # 이미지 경로 처리
+        if image_paths and len(image_paths) > 1 and use_video:
+            # 여러 이미지를 비디오로 변환하여 전달 (dynamic FPS sampling 활용)
+            try:
+                video_path = images_to_video(image_paths, fps=2.0)  # 2 FPS (nuScenes는 보통 2Hz)
+                content = [{"type": "video", "video": video_path}, {"type": "text", "text": prompt}]
+                temp_video_file = video_path  # 나중에 삭제하기 위해 저장
+            except Exception as e:
+                print(f"Warning: Failed to create video from images: {e}. Falling back to individual images.")
+                # 비디오 생성 실패 시 개별 이미지로 fallback
+                image_contents = [{"type": "image", "image": path} for path in image_paths]
+                content = image_contents + [{"type": "text", "text": prompt}]
+                temp_video_file = None
+        elif image_paths and len(image_paths) > 0:
+            # 단일 이미지 또는 use_video=False인 경우
+            image_contents = [{"type": "image", "image": path} for path in image_paths]
+            content = image_contents + [{"type": "text", "text": prompt}]
+            temp_video_file = None
         else:
-            import tempfile
+            # 기존 방식: 현재 이미지만 사용
             with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as f:
                 image.save(f.name)
-                image_content = {"type": "image", "image": f.name}
+                content = [{"type": "image", "image": f.name}, {"type": "text", "text": prompt}]
+                temp_video_file = None
 
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    image_content,
-                    {"type": "text", "text": prompt},
-                ],
-            }
-        ]
+        # 메시지 구성
+        messages = []
+
+        # System role 추가 (선택적)
+        if system_prompt:
+            messages.append({
+                "role": "system",
+                "content": [{"type": "text", "text": system_prompt}]
+            })
+
+        # User role 추가
+        messages.append({
+            "role": "user",
+            "content": content,
+        })
 
         # Apply chat template
         text = self.processor.apply_chat_template(
@@ -309,6 +446,13 @@ class Qwen25VLModel(VLMInterface):
             clean_up_tokenization_spaces=False
         )[0]
 
+        # 임시 비디오 파일 정리
+        if temp_video_file and os.path.exists(temp_video_file):
+            try:
+                os.unlink(temp_video_file)
+            except:
+                pass  # 삭제 실패해도 무시
+        
         return {
             'text': generated_text.strip(),
             'token_ids': generated_ids[0].cpu().tolist(),
@@ -384,32 +528,63 @@ class Qwen3VLModel(VLMInterface):
         print(f"Qwen3-VL model loaded (dtype: {dtype})")
 
     def generate(self, image: Image.Image, prompt: str, max_new_tokens: int = 2048,
-                 image_path: str = None) -> Dict[str, Any]:
+                 image_paths: Optional[List[str]] = None, use_video: bool = True,
+                 system_prompt: Optional[str] = None) -> Dict[str, Any]:
         """
         Generate response from image and prompt.
         For thinking models, enables thinking mode and strips thinking content from output.
+
+        Args:
+            image: 현재 프레임 이미지 (PIL Image)
+            prompt: 프롬프트 텍스트
+            system_prompt: System role 메시지 (선택적)
+            max_new_tokens: 최대 생성 토큰 수
+            image_paths: 이미지 경로 리스트 (첫 번째는 과거, 마지막은 현재 프레임)
+            use_video: True면 여러 이미지를 비디오로 변환하여 전달 (dynamic FPS sampling 활용)
         """
         torch, _, _ = get_vlm_imports()
         from qwen_vl_utils import process_vision_info
 
-        # Qwen3-VL works better with file paths
-        if image_path:
-            image_content = {"type": "image", "image": image_path}
+        # 이미지 경로 처리
+        if image_paths and len(image_paths) > 1 and use_video:
+            # 여러 이미지를 비디오로 변환하여 전달 (dynamic FPS sampling 활용)
+            try:
+                video_path = images_to_video(image_paths, fps=2.0)  # 2 FPS (nuScenes는 보통 2Hz)
+                content = [{"type": "video", "video": video_path}, {"type": "text", "text": prompt}]
+                temp_video_file = video_path  # 나중에 삭제하기 위해 저장
+            except Exception as e:
+                print(f"Warning: Failed to create video from images: {e}. Falling back to individual images.")
+                # 비디오 생성 실패 시 개별 이미지로 fallback
+                image_contents = [{"type": "image", "image": path} for path in image_paths]
+                content = image_contents + [{"type": "text", "text": prompt}]
+                temp_video_file = None
+        elif image_paths and len(image_paths) > 0:
+            # 단일 이미지 또는 use_video=False인 경우
+            image_contents = [{"type": "image", "image": path} for path in image_paths]
+            content = image_contents + [{"type": "text", "text": prompt}]
+            temp_video_file = None
         else:
-            import tempfile
+            # 기존 방식: 현재 이미지만 사용
             with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as f:
                 image.save(f.name)
-                image_content = {"type": "image", "image": f.name}
+                content = [{"type": "image", "image": f.name}, {"type": "text", "text": prompt}]
+                temp_video_file = None
 
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    image_content,
-                    {"type": "text", "text": prompt},
-                ],
-            }
-        ]
+        # 메시지 구성
+        messages = []
+
+        # System role 추가 (선택적)
+        if system_prompt:
+            messages.append({
+                "role": "system",
+                "content": [{"type": "text", "text": system_prompt}]
+            })
+
+        # User role 추가
+        messages.append({
+            "role": "user",
+            "content": content,
+        })
 
         # Apply chat template - for thinking models, enable thinking
         if self.is_thinking_model:
@@ -462,6 +637,13 @@ class Qwen3VLModel(VLMInterface):
             print(f"  Warning: Detected potentially garbled text output. First 100 chars: {generated_text[:100]}")
             print(f"  This may indicate model/tokenizer mismatch or memory issues.")
 
+        # 임시 비디오 파일 정리
+        if 'temp_video_file' in locals() and temp_video_file and os.path.exists(temp_video_file):
+            try:
+                os.unlink(temp_video_file)
+            except:
+                pass  # 삭제 실패해도 무시
+
         return {
             'text': generated_text.strip(),
             'token_ids': generated_ids[0].cpu().tolist(),
@@ -473,10 +655,13 @@ def get_vlm_model(model_id: str, device: str = "cuda", dtype: str = "float16") -
     model_id_lower = model_id.lower()
 
     if "llava" in model_id_lower:
+        model_id = "llava-hf/llava-1.5-7b-hf"
         return LLaVAModel(model_id, device, dtype)
     elif "qwen3" in model_id_lower:
+        model_id = "Qwen/Qwen3-VL-7B-Instruct"
         return Qwen3VLModel(model_id, device, dtype)
     elif "qwen2" in model_id_lower or "qwen" in model_id_lower:
+        model_id = "Qwen/Qwen2.5-VL-7B-Instruct"
         return Qwen25VLModel(model_id, device, dtype)
     else:
         raise ValueError(f"Unknown VLM model: {model_id}. Supported: LLaVA, Qwen2.5-VL, Qwen3-VL")
@@ -596,17 +781,16 @@ def sanitize_text_for_display(text: str) -> str:
 def create_visualization(image: Image.Image, prompt: str, response: str,
                         output_path: str, sample_token: str):
     """이미지, 프롬프트, 응답을 하나의 이미지로 시각화하여 저장"""
-
     # Thinking 모델의 <think> 태그 제거 후 sanitize
-    response = strip_thinking_tags(response)
+    # response = strip_thinking_tags(response)
 
     # Garbled text 감지 및 대체
     if is_garbled_text(response):
         response = "[ERROR: Garbled text detected - model output may be corrupted. Please check model/tokenizer configuration.]"
 
     # 텍스트 sanitize (폰트 호환성 문제 방지)
-    prompt = sanitize_text_for_display(prompt)
-    response = sanitize_text_for_display(response)
+    # prompt = sanitize_text_for_display(prompt)
+    # response = sanitize_text_for_display(response)
 
     # 이미지 크기
     img_width, img_height = image.size
@@ -745,6 +929,189 @@ def wrap_text(text: str, font, max_width: int, draw: ImageDraw.Draw = None) -> L
 # Original Functions (from curate_validation_data.py)
 # ============================================================================
 
+# Global cache for scene_token to scene_name mapping
+_SCENE_TOKEN_TO_NAME_CACHE = {}
+
+
+def _load_scene_token_mapping(data_root: str) -> Dict[str, str]:
+    """
+    Load scene_token to scene_name mapping from nuScenes metadata
+
+    Args:
+        data_root: nuScenes 데이터 루트 경로
+
+    Returns:
+        Dict mapping scene_token to scene_name
+    """
+    global _SCENE_TOKEN_TO_NAME_CACHE
+
+    if data_root in _SCENE_TOKEN_TO_NAME_CACHE:
+        return _SCENE_TOKEN_TO_NAME_CACHE[data_root]
+
+    import json
+    import os
+
+    mapping = {}
+    scene_json_path = os.path.join(data_root, 'v1.0-trainval', 'scene.json')
+
+    if os.path.exists(scene_json_path):
+        try:
+            with open(scene_json_path, 'r') as f:
+                scenes = json.load(f)
+            for scene in scenes:
+                mapping[scene['token']] = scene['name']
+        except:
+            pass
+
+    _SCENE_TOKEN_TO_NAME_CACHE[data_root] = mapping
+    return mapping
+
+
+def format_vehicle_status(can_bus: np.ndarray, scene_token: str = None,
+                         timestamp: int = None, data_root: str = 'data/nuscenes',
+                         temporal_window: int = 1000000) -> str:
+    """
+    CAN bus 데이터에서 차량 상태(Driving Command + Speed)를 통합 형식으로 변환
+    구버전 pkl (크기 18)인 경우 실제 CAN bus 파일에서 직접 읽어옴
+
+    Turn signal의 깜박임 특성을 고려하여 시간적 통합(temporal aggregation) 적용:
+    현재 timestamp ± temporal_window 범위 내에 ON이 있으면 ON으로 처리
+
+    Args:
+        can_bus: (18,) 또는 (20,) 형태의 numpy array
+                 can_bus[18]: left_signal (0 or 1) - if size is 20
+                 can_bus[19]: right_signal (0 or 1) - if size is 20
+        scene_token: Scene token (구버전 pkl에서 CAN bus 읽을 때 필요)
+        timestamp: Sample timestamp (구버전 pkl에서 CAN bus 읽을 때 필요)
+        data_root: nuScenes 데이터 루트 경로
+        temporal_window: 시간 윈도우 (microseconds, 기본값: 1초 = 1,000,000)
+
+    Returns:
+        (command, speed): Tuple containing:
+        - command (str): Driving command
+            - "Turn Left or Lane Change to the Left"
+            - "Turn Right or Lane Change to the Right"
+            - "Go Straight"
+        - speed (float): Vehicle speed in km/h
+    """
+    vehicle_speed = 0.0  # Default speed
+
+    if len(can_bus) >= 20:
+        # 새 버전: can_bus에 turn signal 정보 포함
+        # 새 버전도 temporal aggregation 적용 (CAN bus 파일에서 확인)
+        left_signal = int(can_bus[18])
+        right_signal = int(can_bus[19])
+
+        # 새 버전이지만 temporal aggregation과 속도를 위해 CAN bus 파일도 확인
+        if scene_token is not None and timestamp is not None:
+            try:
+                import json
+                import os
+
+                scene_mapping = _load_scene_token_mapping(data_root)
+                scene_name = scene_mapping.get(scene_token)
+
+                if scene_name:
+                    can_bus_dir = os.path.join(data_root, 'can_bus', 'can_bus')
+                    vehicle_monitor_path = os.path.join(can_bus_dir, f"{scene_name}_vehicle_monitor.json")
+
+                    if os.path.exists(vehicle_monitor_path):
+                        with open(vehicle_monitor_path, 'r') as f:
+                            vehicle_monitor_list = json.load(f)
+
+                        # Temporal aggregation: ±temporal_window 범위 내 모든 신호 확인
+                        left_signals_in_window = []
+                        right_signals_in_window = []
+                        closest_monitor = None
+                        min_time_diff = float('inf')
+
+                        for monitor in vehicle_monitor_list:
+                            time_diff = abs(monitor['utime'] - timestamp)
+                            if time_diff <= temporal_window:
+                                left_signals_in_window.append(monitor.get('left_signal', 0))
+                                right_signals_in_window.append(monitor.get('right_signal', 0))
+
+                                # 속도는 가장 가까운 timestamp의 값 사용
+                                if time_diff < min_time_diff:
+                                    min_time_diff = time_diff
+                                    closest_monitor = monitor
+
+                        # 윈도우 내에 하나라도 ON이면 ON으로 처리
+                        if left_signals_in_window:
+                            left_signal = 1 if any(left_signals_in_window) else 0
+                        if right_signals_in_window:
+                            right_signal = 1 if any(right_signals_in_window) else 0
+
+                        # 속도 추출 (가장 가까운 시점의 속도)
+                        if closest_monitor:
+                            vehicle_speed = float(closest_monitor.get('vehicle_speed', 0.0))
+            except:
+                pass
+    else:
+        # 구버전: CAN bus 파일에서 직접 읽기 (temporal aggregation 포함)
+        left_signal = 0
+        right_signal = 0
+
+        if scene_token is not None and timestamp is not None:
+            try:
+                import json
+                import os
+
+                # scene_token으로 scene name 찾기
+                scene_mapping = _load_scene_token_mapping(data_root)
+                scene_name = scene_mapping.get(scene_token)
+
+                if scene_name:
+                    # 해당 scene의 vehicle_monitor 파일 직접 로드
+                    can_bus_dir = os.path.join(data_root, 'can_bus', 'can_bus')
+                    vehicle_monitor_path = os.path.join(can_bus_dir, f"{scene_name}_vehicle_monitor.json")
+
+                    if os.path.exists(vehicle_monitor_path):
+                        with open(vehicle_monitor_path, 'r') as f:
+                            vehicle_monitor_list = json.load(f)
+
+                        # Temporal aggregation: ±temporal_window 범위 내 모든 신호 확인
+                        left_signals_in_window = []
+                        right_signals_in_window = []
+                        closest_monitor = None
+                        min_time_diff = float('inf')
+
+                        for monitor in vehicle_monitor_list:
+                            time_diff = abs(monitor['utime'] - timestamp)
+                            if time_diff <= temporal_window:
+                                left_signals_in_window.append(monitor.get('left_signal', 0))
+                                right_signals_in_window.append(monitor.get('right_signal', 0))
+
+                                # 속도는 가장 가까운 timestamp의 값 사용
+                                if time_diff < min_time_diff:
+                                    min_time_diff = time_diff
+                                    closest_monitor = monitor
+
+                        # 윈도우 내에 하나라도 ON이면 ON으로 처리
+                        if left_signals_in_window:
+                            left_signal = 1 if any(left_signals_in_window) else 0
+                        if right_signals_in_window:
+                            right_signal = 1 if any(right_signals_in_window) else 0
+
+                        # 속도 추출 (가장 가까운 시점의 속도)
+                        if closest_monitor:
+                            vehicle_speed = float(closest_monitor.get('vehicle_speed', 0.0))
+            except Exception as e:
+                # 실패하면 기본값 사용
+                pass
+
+    # Convert turn signal to driving command
+    if left_signal == 1:
+        command = "Turn Left or Lane Change to the Left"
+    elif right_signal == 1:
+        command = "Turn Right or Lane Change to the Right"
+    else:
+        command = "Go Straight"
+
+    # Return command and speed as tuple for flexible prompt formatting
+    return command, vehicle_speed
+
+
 def extract_scene_tokens_from_dir(video_dir):
     """디렉토리 내 영상 파일명에서 scene_token 추출"""
     if not os.path.isdir(video_dir):
@@ -770,13 +1137,32 @@ def extract_scene_tokens_from_dir(video_dir):
     return scene_tokens
 
 
-def load_pkl(ann_file):
-    """pkl 파일 로드"""
-    print(f"Loading {ann_file}...")
-    with open(ann_file, 'rb') as f:
-        data = pickle.load(f)
-    print(f"Loaded {len(data['infos'])} samples")
-    return data
+def load_pkl(ann_files):
+    """pkl 파일 로드 (단일 파일 또는 여러 파일)"""
+    # 단일 파일인 경우 리스트로 변환
+    if isinstance(ann_files, str):
+        ann_files = [ann_files]
+
+    all_infos = []
+    metadata = None
+
+    for ann_file in ann_files:
+        print(f"Loading {ann_file}...")
+        with open(ann_file, 'rb') as f:
+            data = pickle.load(f)
+        print(f"  Loaded {len(data['infos'])} samples")
+        all_infos.extend(data['infos'])
+
+        # 첫 번째 파일의 metadata 사용
+        if metadata is None:
+            metadata = data.get('metadata', {'version': 'merged'})
+
+    print(f"Total loaded: {len(all_infos)} samples from {len(ann_files)} file(s)")
+
+    return {
+        'infos': all_infos,
+        'metadata': metadata
+    }
 
 
 def save_pkl(data, output_file):
@@ -963,9 +1349,16 @@ def vlm_curate_scenes(
     prompt: str,
     device: str = "cuda",
     max_new_tokens: int = 2048,
+    num_history_frames: int = 0,
     visualize: bool = False,
+    system_prompt: Optional[str] = None,
 ):
-    """VLM 응답을 포함하여 curated pkl 생성"""
+    """VLM 응답을 포함하여 curated pkl 생성
+
+    Args:
+        num_history_frames: 과거 프레임 이미지 개수 (0이면 현재 프레임만 사용)
+        system_prompt: System role 메시지 (선택적)
+    """
 
     # 데이터 로드
     data = load_pkl(ann_file)
@@ -1016,7 +1409,7 @@ def vlm_curate_scenes(
 
     for idx, info in enumerate(tqdm(filtered_infos, desc="Processing samples")):
         try:
-            # CAM_FRONT 이미지 로드
+            # CAM_FRONT 이미지 로드 (현재 프레임)
             cam_front = info['cams']['CAM_FRONT']
             img_path = os.path.join(data_root, cam_front['data_path'])
 
@@ -1027,6 +1420,39 @@ def vlm_curate_scenes(
 
             image = Image.open(img_path).convert('RGB')
 
+            # Vehicle Status 추출 (구버전 pkl인 경우 CAN bus 파일에서 직접 읽기)
+            can_bus = info.get('can_bus', np.zeros(20))
+            scene_token = info.get('scene_token')
+            timestamp = info.get('timestamp')
+            command, speed = format_vehicle_status(
+                can_bus,
+                scene_token=scene_token,
+                timestamp=timestamp,
+                data_root=data_root
+            )
+
+            # 프롬프트 템플릿에 Vehicle Status 변수 적용
+            final_prompt = prompt.format(COMMAND=command, SPEED=speed)
+
+            # 과거 프레임 이미지 경로 수집
+            image_paths = [img_path]  # 현재 프레임 경로
+            if num_history_frames > 0:
+                for i in range(1, num_history_frames + 1):
+                    if idx - i >= 0:
+                        prev_info = filtered_infos[idx - i]
+                        # 같은 scene 내에서만 과거 프레임 사용
+                        if prev_info['scene_token'] == info['scene_token']:
+                            prev_cam = prev_info['cams']['CAM_FRONT']
+                            prev_path = os.path.join(data_root, prev_cam['data_path'])
+                            if os.path.exists(prev_path):
+                                image_paths.insert(0, prev_path)  # 과거 프레임을 앞에 추가
+                            else:
+                                break  # 경로가 없으면 더 이상 과거 프레임 찾지 않음
+                        else:
+                            break  # 다른 scene이면 중단
+                    else:
+                        break  # 인덱스 범위를 벗어나면 중단
+
             # VLM 응답 생성 (OOM 발생 시 토큰 수 줄여서 재시도)
             import torch
             import gc
@@ -1036,10 +1462,12 @@ def vlm_curate_scenes(
 
             for attempt, tokens in enumerate(retry_tokens):
                 try:
-                    if hasattr(vlm, 'generate') and 'image_path' in vlm.generate.__code__.co_varnames:
-                        response = vlm.generate(image, prompt, max_new_tokens=tokens, image_path=img_path)
-                    else:
-                        response = vlm.generate(image, prompt, max_new_tokens=tokens)
+                    # Qwen 모델인 경우 비디오로 전달 (dynamic FPS sampling 활용)
+                    use_video = isinstance(vlm, (Qwen25VLModel, Qwen3VLModel)) and len(image_paths) > 1
+                    # image_paths를 전달 (현재 + 과거 프레임)
+                    response = vlm.generate(image, final_prompt, max_new_tokens=tokens,
+                                          image_paths=image_paths, use_video=use_video,
+                                          system_prompt=system_prompt)
                     break  # 성공하면 루프 종료
                 except (RuntimeError, torch.cuda.OutOfMemoryError) as oom_error:
                     error_msg = str(oom_error).lower()
@@ -1058,10 +1486,13 @@ def vlm_curate_scenes(
             if response is None:
                 raise RuntimeError("Failed to generate response after all retries")
 
-            # 응답 저장
+            # 응답 저장 (Vehicle Status가 포함된 프롬프트 저장)
             info['vlm_response'] = {
                 'model': vlm_model_id,
-                'prompt': prompt,
+                'prompt': final_prompt,
+                'prompt_template': prompt,  # 원본 템플릿 저장
+                'command': command,
+                'speed': speed,
                 'text': response['text'],
                 'token_ids': response['token_ids'],
             }
@@ -1072,7 +1503,7 @@ def vlm_curate_scenes(
                 frame_idx = scene_frame_counter[scene_token]
                 scene_frame_counter[scene_token] += 1
                 vis_path = os.path.join(vis_dir, f"{scene_token}_{frame_idx}.jpg")
-                create_visualization(image, prompt, response['text'], vis_path, info['token'])
+                create_visualization(image, final_prompt, response['text'], vis_path, info['token'])
 
         except Exception as e:
             print(f"Error processing sample {info.get('token', 'unknown')}: {e}")
@@ -1145,8 +1576,9 @@ Examples:
     )
     parser.add_argument(
         '--ann_file',
-        default='data/infos/nuscenes_infos_temporal_val.pkl',
-        help='원본 annotation pkl 파일 경로'
+        nargs='+',
+        default=['data/infos/nuscenes_infos_temporal_val.pkl', 'data/infos/nuscenes_infos_temporal_train.pkl'],
+        help='원본 annotation pkl 파일 경로 (1개 이상 지정 가능, 기본값: val + train)'
     )
     parser.add_argument(
         '--data_root',
@@ -1178,9 +1610,46 @@ Examples:
         help='VLM 모델 ID (예: Qwen/Qwen2.5-VL-3B-Instruct, llava-hf/llava-1.5-7b-hf)'
     )
     parser.add_argument(
+        '--system_prompt',
+        default=
+            'You are a high-level planner for an autonomous driving system. '\
+            'Analyze driving scenes carefully and provide safe, appropriate driving plans.',
+        help='System role 메시지 (모델의 행동 방식을 정의)'
+    )
+    parser.add_argument(
         '--prompt',
-        default='Describe the driving scenario in this image.',
-        help='VLM에 전달할 프롬프트'
+        default=
+            ### prompt template version 1 ###
+            #         '[Vehicle Status]\
+            #  - Driving Command: {COMMAND}\
+            #  - Current Speed: {SPEED:.1f} km/h\
+            # \
+            # You are the high-level planner for an autonomous driving system.\
+            # \
+            #  I will provide a front-facing camera image from the ego vehicle.\
+            #  Based on the scene in the image, issue a high-level driving instruction that a trajectory planner should follow, and explain the reasoning.\
+            #  Output must follow this exact format:\
+            # \
+            # **SPEED plan** : { e.g. Speed up, Slow down, Speed up rapidly, Slow down rapily, Constant speed, Stop, Reverse, etc. }\
+            # **PATH plan** : { e.g. Go straight, Turn left, Turn right, Change lane to the left, Change lane to the right, Shift slightly to the left, Shift slighly to the right, Make a U-turn, etc. }\
+            # **Reason** : { your detailed explanation of why this plan is safest/most appropriate given the scene }\
+            # \
+            #  Guidelines\
+            #  - The Reason should reference visible cues in the image (e.g., obstacles, vehicles, pedestrians, traffic lights/signs, lane markings, road curvature, visibility, parked cars, construction zones).\
+            #  - If there is uncertainty (occlusion, unclear right-of-way, limited visibility), state that and choose a more cautious plan.\
+            # \
+            #  Now analyze the provided image and respond ONLY using the required format.'
+
+            ### prompt template version 2 ###
+            # 'Your current speed is {SPEED:.1f} km/h, the navigation command is {COMMAND}.'\
+            'Your current speed is {SPEED:.1f} km/h. '\
+            'Based on the understanding of the driving scene and the navigation command information,'\
+            'What is your plan for the next three seconds?'\
+            'Please answer your SPEED plan and PATH plan. SPEED includes KEEP, ACCELERATE and DECELERATE, STOP, REVERSE, etc. '\
+            'PATH includes STRAIGHT, TURN_LEFT, TURN_RIGHT, LANECHANGE_LEFT, LANECHANGE_RIGHT, SHIFT_SLIGHTLY_LEFT, SHIFT_SLIGHTLY_RIGHT, MAKE_U_TURN, etc. '\
+            'For example, a correct answer format is: SPEED: DECELERATE, PATH: SHIFT_SLIGHTLY_LEFT. ',
+
+        help='VLM에 전달할 프롬프트 (Use {COMMAND} and {SPEED} as placeholders for vehicle status)'
     )
     parser.add_argument(
         '--max_new_tokens',
@@ -1189,8 +1658,14 @@ Examples:
         help='VLM 최대 생성 토큰 수 (기본값: 2048, 긴 응답 생성 가능)'
     )
     parser.add_argument(
+        '--num_history_frames',
+        type=int,
+        default=0,
+        help='과거 프레임 이미지 개수 (기본값: 0, 현재 프레임만 사용)'
+    )
+    parser.add_argument(
         '--device',
-        default='cuda',
+        default='cuda:0,1',
         help='VLM 실행 디바이스 (cuda, cpu, auto)'
     )
     parser.add_argument(
@@ -1240,7 +1715,9 @@ Examples:
             prompt=args.prompt,
             device=args.device,
             max_new_tokens=args.max_new_tokens,
+            num_history_frames=args.num_history_frames,
             visualize=args.visualize,
+            system_prompt=args.system_prompt,
         )
 
 

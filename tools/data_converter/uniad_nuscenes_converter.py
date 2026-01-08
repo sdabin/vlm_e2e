@@ -153,7 +153,7 @@ def _get_can_bus_info(nusc, nusc_can_bus, sample):
     try:
         pose_list = nusc_can_bus.get_messages(scene_name, 'pose')
     except:
-        return np.zeros(18)  # server scenes do not have can bus information.
+        return np.zeros(20)  # server scenes do not have can bus information.
     can_bus = []
     # during each scene, the first timestamp of can_bus may be large than the first sample's timestamp
     last_pose = pose_list[0]
@@ -168,7 +168,23 @@ def _get_can_bus_info(nusc, nusc_can_bus, sample):
     can_bus.extend(rotation)
     for key in last_pose.keys():
         can_bus.extend(pose[key])  # 16 elements
-    can_bus.extend([0., 0.])
+
+    # Add turn signal information from vehicle_monitor
+    left_signal = 0.0
+    right_signal = 0.0
+    try:
+        vehicle_monitor_list = nusc_can_bus.get_messages(scene_name, 'vehicle_monitor')
+        last_monitor = vehicle_monitor_list[0]
+        for monitor in vehicle_monitor_list:
+            if monitor['utime'] > sample_timestamp:
+                break
+            last_monitor = monitor
+        left_signal = float(last_monitor.get('left_signal', 0))
+        right_signal = float(last_monitor.get('right_signal', 0))
+    except:
+        pass  # If vehicle_monitor is not available, use default 0
+
+    can_bus.extend([left_signal, right_signal])
     return np.array(can_bus)
 
 def _get_future_traj_info(nusc, sample, predict_steps=16):

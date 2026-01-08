@@ -71,7 +71,7 @@ class PerceptionTransformer(BaseModule):
         self.cams_embeds = nn.Parameter(
             torch.Tensor(self.num_cams, self.embed_dims))
         self.can_bus_mlp = nn.Sequential(
-            nn.Linear(18, self.embed_dims // 2),
+            nn.Linear(20, self.embed_dims // 2),  # Updated to 20 to include left_signal and right_signal
             nn.ReLU(inplace=True),
             nn.Linear(self.embed_dims // 2, self.embed_dims),
             nn.ReLU(inplace=True),
